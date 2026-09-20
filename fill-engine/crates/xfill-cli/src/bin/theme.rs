@@ -256,11 +256,12 @@ fn main() {
     });
     let dur = t0.elapsed().as_secs_f64();
 
-    // Dedup + rank the kept clean grids, write the themed library.
-    let mut kept = kept.into_inner().unwrap();
-    let mut seen = HashSet::new();
-    kept.retain(|g| seen.insert(g.template.join("\n")));
-    kept.sort_by(|a, b| b.mean.partial_cmp(&a.mean).unwrap());
+    // Rank (fewest weak, then mean) + dedup the kept clean grids — best fill
+    // per shape, exact-duplicate fills dropped — and write the themed library.
+    let mut kept = xfill_core::library::select_keepers(
+        kept.into_inner().unwrap(),
+        xfill_core::library::DEFAULT_PER_SHAPE,
+    );
     kept.truncate(top);
     write_json(&out, &kept, &wordlist, blocks, &themes).expect("write themed library");
 

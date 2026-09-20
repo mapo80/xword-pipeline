@@ -6,8 +6,9 @@
 //!
 //! Usage: library [--wordlist PATH] [--size N] [--blocks N] [--block-jitter N]
 //!                [--candidates N] [--time SECS] [--keep-mean F] [--max-iffy N]
-//!                [--weak-bar N] [--max-weak N] [--top N] [--seed N]
-//!                [--bank PATH] [--bank-fraction F] [--workers N] [--out PATH]
+//!                [--weak-bar N] [--max-weak N] [--min-words N] [--per-shape N]
+//!                [--top N] [--seed N] [--bank PATH] [--bank-fraction F]
+//!                [--workers N] [--out PATH]
 //!
 //! `--size` is the grid dimension (default 15; e.g. 5 or 10 for minis). The
 //! default block count scales with the grid area when `--blocks` is omitted.
@@ -81,6 +82,10 @@ fn main() {
         xfill_core::solver::DEFAULT_WEAK_BAR
     };
     let max_weak: usize = arg("--max-weak", usize::MAX);
+    // Keep at most this many fills of any one template (0 = unlimited). Small
+    // symmetric grids have tiny shape spaces — five 5x5 templates in total —
+    // so several fills per shape ARE the variety; see library::select_keepers.
+    let per_shape: usize = arg("--per-shape", xfill_core::library::DEFAULT_PER_SHAPE);
     let out: String = arg("--out", "../out/libraries/grid-library.json".to_string());
     // Template bank: draw this fraction of candidates from clean-proven
     // shapes (see xfill_core::bank; build with the tpl-bank bin). -1 = auto
@@ -286,23 +291,18 @@ fn main() {
     });
     let dur = t0.elapsed().as_secs_f64();
 
-    let mut kept = kept.into_inner().unwrap();
-    let mut seen = HashSet::new();
-    kept.retain(|g| seen.insert(g.template.join("\n")));
-    // Fewest weak entries first (what an editor screens for), mean breaks ties
-    // — matches the solver's own clean-track ordering.
-    kept.sort_by(|a, b| {
-        a.weak
-            .cmp(&b.weak)
-            .then(b.mean.partial_cmp(&a.mean).unwrap())
-    });
+    // Fewest-weak-then-mean order, exact-duplicate fills dropped, at most
+    // `per_shape` fills of any one template — sorting BEFORE the dedup is what
+    // keeps each shape's best fill rather than its first-finished one.
+    let mut kept = xfill_core::library::select_keepers(kept.into_inner().unwrap(), per_shape);
     kept.truncate(top);
 
     let filled_n = filled.load(Ordering::Relaxed);
     let done_n = done.load(Ordering::Relaxed);
     eprintln!(
-        "\nfilled {filled_n}/{done_n} in {dur:.1}s; {} clean grids kept (mean>={keep_mean}, iffy<={max_iffy})",
-        kept.len()
+        "\nfilled {filled_n}/{done_n} in {dur:.1}s; {} clean grids kept over {} shapes (mean>={keep_mean}, iffy<={max_iffy})",
+        kept.len(),
+        xfill_core::library::distinct_shapes(&kept)
     );
     if done_n < jobs.len() {
         eprintln!(

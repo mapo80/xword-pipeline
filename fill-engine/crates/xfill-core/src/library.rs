@@ -4,7 +4,14 @@
 
 use crate::grid::{Dir, Puzzle};
 use crate::solver::{SolveResult, SolvedFill};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Pipeline default for `select_keepers`' per-shape cap. Four fills of one
+/// template is enough variety that a 5×5 run (whose symmetric shape space is
+/// FIVE templates in total) still produces a full top-20, while at 9×9 and up
+/// shapes are plentiful (~190 distinct per 300 candidates) so the cap rarely
+/// binds. Callers surface this as a tunable; 0 lifts the cap.
+pub const DEFAULT_PER_SHAPE: usize = 4;
 
 pub struct LibEntry {
     pub num: u32,
@@ -108,6 +115,56 @@ fn build_from_parts(
             .collect(),
         entries,
     }
+}
+
+/// Order kept grids for output and collapse duplicates: fewest weak entries
+/// first (mean breaks ties — the solver's own clean-track ordering), then
+/// drop exact-duplicate FILLS, then keep at most `per_shape` fills of any one
+/// template (0 = unlimited). Callers truncate to their `top` afterwards.
+///
+/// The sort happens BEFORE the dedup so the survivors of each shape are its
+/// best fills, not whichever workers finished first. That ordering matters
+/// far more than it sounds: small symmetric grids have tiny shape spaces (a
+/// 300-candidate 5×5 run contains five distinct templates; 7×7 about 23), so
+/// the old template-level dedup collapsed every run to a handful of grids and
+/// discarded the best fill of each. Different fills of one shape are
+/// different puzzles (minis reuse a few shapes daily), so they are kept, up
+/// to the cap; exact-duplicate fills are never worth keeping twice.
+pub fn select_keepers(mut kept: Vec<LibGrid>, per_shape: usize) -> Vec<LibGrid> {
+    kept.sort_by(|a, b| {
+        a.weak.cmp(&b.weak).then(
+            b.mean
+                .partial_cmp(&a.mean)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    let mut seen_fill: HashSet<String> = HashSet::new();
+    let mut per_tpl: HashMap<String, usize> = HashMap::new();
+    kept.retain(|g| {
+        if !seen_fill.insert(g.fill.join("\n")) {
+            return false;
+        }
+        if per_shape == 0 {
+            return true;
+        }
+        let n = per_tpl.entry(g.template.join("\n")).or_insert(0);
+        if *n >= per_shape {
+            return false;
+        }
+        *n += 1;
+        true
+    });
+    kept
+}
+
+/// Number of distinct templates among `grids` — surfaced by the screeners so
+/// a shape-space collapse (five 5×5 shapes) is visible, not silent.
+pub fn distinct_shapes(grids: &[LibGrid]) -> usize {
+    grids
+        .iter()
+        .map(|g| g.template.join("\n"))
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Which member(s) of a root-duplicate pair to try banning for a refill
@@ -219,6 +276,53 @@ mod tests {
             fill: Vec::new(),
             entries,
         }
+    }
+
+    /// A kept grid with just the fields `select_keepers` reads: shape, fill
+    /// (one row per letter-string, for brevity), weak count, mean.
+    fn shaped(tpl: &str, fill: &str, weak: usize, mean: f64) -> LibGrid {
+        let mut g = grid(Vec::new());
+        g.template = vec![tpl.to_string()];
+        g.fill = vec![fill.to_string()];
+        g.weak = weak;
+        g.mean = mean;
+        g
+    }
+
+    #[test]
+    fn select_keepers_keeps_best_fills_per_shape_not_first_finished() {
+        // Completion order deliberately puts the WORST fill of shape A first.
+        let kept = vec![
+            shaped("A", "a-worst", 2, 80.0),
+            shaped("B", "b-only", 0, 82.0),
+            shaped("A", "a-best", 0, 88.0),
+            shaped("A", "a-mid", 0, 85.0),
+            shaped("A", "a-third", 1, 90.0),
+        ];
+        let out = select_keepers(kept, 2);
+        let fills: Vec<&str> = out.iter().map(|g| g.fill[0].as_str()).collect();
+        // Fewest-weak-then-mean order, and shape A capped at its two best.
+        assert_eq!(fills, vec!["a-best", "a-mid", "b-only"]);
+    }
+
+    #[test]
+    fn select_keepers_drops_exact_duplicate_fills_and_uncaps_at_zero() {
+        let kept = || {
+            vec![
+                shaped("A", "same", 0, 90.0),
+                shaped("A", "same", 0, 90.0), // identical fill from another seed
+                shaped("A", "other", 0, 89.0),
+                shaped("A", "third", 0, 88.0),
+            ]
+        };
+        let out = select_keepers(kept(), 0);
+        assert_eq!(out.len(), 3, "duplicate fill collapses; no per-shape cap");
+        assert_eq!(
+            select_keepers(kept(), 1).len(),
+            1,
+            "cap 1 keeps the best only"
+        );
+        assert_eq!(distinct_shapes(&out), 1);
     }
 
     #[test]

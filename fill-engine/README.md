@@ -156,7 +156,12 @@ clue-writing pipeline.
 | `--time SECS` | `2.0` | Per-grid fill budget |
 | `--keep-mean F` | `72.0` | Keep only fills with mean answer score ≥ this |
 | `--max-iffy N` | `3` | Keep only fills with ≤ N entries scoring below 50 |
-| `--top N` | `25` | Keep the best N grids (by mean score) after dedup |
+| `--weak-bar N` | `70` | Entries scoring below this count as *weak* (the gluey tail an editor counts); keepers sort fewest-weak-first. `0` = off |
+| `--max-weak N` | none | Keep only fills with ≤ N weak entries |
+| `--min-words N` | auto | Reject candidate shapes with fewer answers before filling — more words fill clean far more reliably. Auto = calibrated per size (16 at 7×7, 28 at 9×9, 72 at 15×15; none below 7×7); `0` = off |
+| `--per-shape N` | `4` | Keep at most N fills of any one shape; the best fills of each shape survive and exact-duplicate fills are dropped. Small symmetric grids have very few shapes (five at 5×5), so this is where their variety comes from. `0` = no cap |
+| `--top N` | `25` | Keep the best N grids (fewest weak, then mean) after dedup |
+| `--bank PATH` / `--bank-fraction F` | `data/tpl-bank-<size>.txt` / auto | Draw this fraction of candidates from the template bank of clean-proven shapes (auto = 0.7 at 15×15, 0 below) |
 | `--seed N` | `1` | RNG seed |
 | `--workers N` | # CPU cores | Worker threads |
 | `--out PATH` | `../out/libraries/grid-library.json` | Output JSON path |

@@ -3,6 +3,19 @@
 ## [0.1.0]
 
 ### Added
+- **Best fills per shape, several per shape.** Screeners now rank kept fills
+  before deduplicating, drop exact-duplicate fills, and keep up to `--per-shape`
+  (default 4) fills of any one template. Small symmetric grids have tiny shape
+  spaces (five 5×5 templates in total, ~23 at 7×7), so the old template-level
+  dedup collapsed every 5×5 run to five grids and kept whichever fill finished
+  first rather than the best. Same run, 5×5: 5 → 16 keepers.
+- **Word floor at midi sizes.** `gen::word_floor` now covers 7×7–12×12
+  (16/22/28/34/40/50 words), calibrated the same way as the 15×15 floor, and
+  applies to seeded minis too: 9×9 shapes with 30 words were 95% weak-free vs
+  0% at 26; the gluey seeded 7×7s were all 14-word shapes. With both changes
+  at publication gates: 7×7 keepers 12–13 → 20, all weak-free, sub-80 entries
+  per grid 0.5–0.85 → 0.15–0.25; 9×9 runs ~35% faster (denser keepers hit the
+  early stop sooner) with fewer sub-80 entries.
 - **Template bank.** The `tpl_bank` bin probes random word-floor-passing
   15×15s and persists the clean-proven minority (kept local); generation
   draws a per-preset fraction from it ("Bank %", Publication 70) — ~1.9×

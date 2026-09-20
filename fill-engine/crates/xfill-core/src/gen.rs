@@ -498,21 +498,43 @@ pub fn jittered_blocks(base: usize, jitter: usize, rng: &mut Rng) -> usize {
     base + (rng.next_u64() as usize) % (jitter + 1)
 }
 
-/// Calibrated word-count floor for themeless candidate templates. At a fixed
-/// block count the block ARRANGEMENT still swings the word count widely, and
-/// word count is a near-step-function predictor of clean fillability: a
-/// template study (1000 patterns x 8 fills, 15x15 @ 38 blocks) found shapes
-/// with <=68 words almost never fill clean (~1%/fill) while >=72-word shapes
-/// fill clean 45-82% of the time — so rejecting sub-floor templates at
-/// generation time roughly triples the clean-keeper rate for free. Minis and
-/// midis already fill clean regardless of shape, so they get NO floor. Callers
-/// apply this at generation and should relax it if it ever starves generation
-/// (a very open, low-block pinned build) — it must never hard-fail a run.
+/// Calibrated word-count floor for candidate templates (themeless and
+/// seeded). At a fixed block count the block ARRANGEMENT still swings the
+/// word count widely, and word count is a near-step-function predictor of
+/// clean fillability: a template study (1000 patterns x 8 fills, 15x15 @ 38
+/// blocks) found shapes with <=68 words almost never fill clean (~1%/fill)
+/// while >=72-word shapes fill clean 45-82% of the time — so rejecting
+/// sub-floor templates at generation time roughly triples the clean-keeper
+/// rate for free.
+///
+/// The same step shows up at every midi size (measured 2026-09, publication
+/// gates, auto blocks, share of keepers with no weak entry by word count):
+///
+/// ```text
+///  7×7: 14w 0-8%   16w 57-80%  20w+ 100%      → floor 16
+///  8×8: 20w 6%     22w 79%     24w+ 100%      → floor 22
+///  9×9: 26w 0%     28w 53%     30w  95%       → floor 28
+/// 10×10: 32w 0%    34w 27%     36w  100%      → floor 34
+/// 11×11: 38w 0%    40w 45%     46w+ 100%      → floor 40
+/// 12×12: 46-48w 0% 50w 50%     52w  100%      → floor 50
+/// ```
+///
+/// Each floor sits at the start of its jump (as 72 does at 15×15) and keeps
+/// roughly a quarter to two thirds of generated shapes; the floors track
+/// ~0.33-0.35 words per cell. Minis (≤6) have essentially one word count per
+/// shape, so they get NO floor. Callers apply this at generation (themeless
+/// and seeded) and should relax it if it ever starves generation (a very
+/// open, low-block pinned build) — it must never hard-fail a run.
 pub fn word_floor(size: usize) -> usize {
-    if size >= 13 {
-        72
-    } else {
-        0
+    match size {
+        13.. => 72,
+        12 => 50,
+        11 => 40,
+        10 => 34,
+        9 => 28,
+        8 => 22,
+        7 => 16,
+        _ => 0,
     }
 }
 
@@ -638,6 +660,26 @@ mod tests {
                 .find_entry(r, c, Dir::Across)
                 .expect("theme slot is an entry");
             assert_eq!(p.entries[ei].len, len, "theme slot has expected length");
+        }
+    }
+
+    /// The floor table: off for minis, the calibrated midi steps, 72 from
+    /// full size up, and monotone in size (a bigger grid never floors lower).
+    #[test]
+    fn word_floor_table_is_calibrated_and_monotone() {
+        assert_eq!(word_floor(5), 0);
+        assert_eq!(word_floor(6), 0);
+        assert_eq!(word_floor(7), 16);
+        assert_eq!(word_floor(9), 28);
+        assert_eq!(word_floor(13), 72);
+        assert_eq!(word_floor(15), 72);
+        assert_eq!(word_floor(21), 72);
+        for size in 4..21 {
+            assert!(
+                word_floor(size) <= word_floor(size + 1),
+                "floor must not drop from {size} to {}",
+                size + 1
+            );
         }
     }
 
