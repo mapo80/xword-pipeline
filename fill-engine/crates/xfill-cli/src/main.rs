@@ -4,8 +4,9 @@
 
 use std::process::ExitCode;
 use std::time::Instant;
+use xfill_core::clues::load_wordlist;
 use xfill_core::grid::Dir;
-use xfill_core::{Lock, Puzzle, SolveConfig, SolveResult, Solver, Wordlist};
+use xfill_core::{Lock, Puzzle, SolveConfig, SolveResult, Solver};
 
 struct Args {
     template: String,
@@ -44,11 +45,11 @@ fn parse_lock(s: &str) -> Result<Lock, String> {
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         template: String::new(),
-        wordlist: "data/xwordlist.dict".to_string(),
-        min_score: 40,
+        wordlist: "../../dataset/Db.csv".to_string(),
+        min_score: 0,
         time_limit: 30.0,
         seed: 0,
-        tiers: vec![40, 50, 55, 60, 70],
+        tiers: vec![50, 58, 63],
         first: false,
         boxed: false,
         workers: 1,
@@ -110,7 +111,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if !got_template {
-        return Err("usage: xfill <template> [--wordlist PATH] [--min-score N] [--time SECS] [--seed N] [--tiers 40,50,55,60,70] [--first] [--boxed] [--workers N] [--lock ROW,COL,DIR,ANSWER ...]".into());
+        return Err("usage: xfill <template> [--wordlist PATH] [--min-score N] [--time SECS] [--seed N] [--tiers 50,58,63] [--first] [--boxed] [--workers N] [--lock ROW,COL,DIR,ANSWER ...]".into());
     }
     Ok(a)
 }
@@ -125,8 +126,8 @@ fn main() -> ExitCode {
     };
 
     let t = Instant::now();
-    let wl = match Wordlist::load(&args.wordlist, args.min_score) {
-        Ok(w) => w,
+    let wl = match load_wordlist(&args.wordlist, args.min_score) {
+        Ok((w, _clues)) => w,
         Err(e) => {
             eprintln!("failed to load wordlist {}: {e}", args.wordlist);
             return ExitCode::FAILURE;
@@ -164,6 +165,10 @@ fn main() -> ExitCode {
         tiers: args.tiers,
         seed: args.seed,
         stop_on_first: args.first,
+        // Italian scores start at 50 (one clue in the database): every word
+        // is admissible; single-clue words are the "weak" tail.
+        clean_floor: 50,
+        weak_bar: 58,
         ..Default::default()
     };
 

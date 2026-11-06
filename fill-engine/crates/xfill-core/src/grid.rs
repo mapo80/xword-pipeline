@@ -274,15 +274,21 @@ mod tests {
 
     #[test]
     fn handles_blocks_and_min_run() {
-        // a 2-cell run must NOT become an entry
-        let p = Puzzle::from_template("..#..\n.....\n.....\n.....\n.....\n");
-        // row 0 has runs of 2 and 2 -> no across entries from row 0
-        let across_row0 = p
-            .entries
-            .iter()
-            .filter(|e| e.dir == Dir::Across && e.row == 0)
-            .count();
-        assert_eq!(across_row0, 0);
+        // MIN_LEN is 2 (Italian): a 2-cell run IS an entry, a 1-cell run is not.
+        let p = Puzzle::from_template("..#..\n.#...\n.....\n.....\n.....\n");
+        let across = |row: usize| {
+            p.entries
+                .iter()
+                .filter(|e| e.dir == Dir::Across && e.row == row)
+                .count()
+        };
+        assert_eq!(across(0), 2, "row 0: runs of 2 and 2");
+        assert_eq!(across(1), 1, "row 1: run of 1 (unclued) + run of 3");
+        assert_eq!(
+            p.orphan_cells(),
+            0,
+            "r1c0 is still covered by its down entry"
+        );
     }
 
     #[test]

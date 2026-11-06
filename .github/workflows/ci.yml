@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, italiano]
   pull_request:
-    branches: [main]
+    branches: [main, italiano]
   workflow_dispatch:
 
 concurrency:
@@ -43,27 +43,3 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --release
 
-  clue-writer:
-    name: clue-writer (TypeScript)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: clue-writer
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: clue-writer/package-lock.json
-
-      - name: Install
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test

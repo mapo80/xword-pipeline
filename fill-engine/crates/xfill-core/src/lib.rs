@@ -1,16 +1,19 @@
-//! xfill-core: quality-aware crossword fill engine.
+//! xfill-core: quality-aware crossword fill engine (Italian fork).
 //!
 //! - [`bitset`]: fixed-size bitset (constraint-propagation primitive)
 //! - [`wordlist`]: scored wordlist + compatibility masks
+//! - [`clues`]: `WORD,clue` CSV loader (wordlist + clue database)
 //! - [`grid`]: 2D template → geometry-agnostic [`grid::Puzzle`]
-//! - [`solver`]: M1 DFS solver (MRV + score order)
+//! - [`gen_it`]: Italian-style block-pattern generator
+//! - [`solver`]: DFS solver (MRV + score order + restarts)
+//! - [`library`]: keeper selection + JSON artifact
 
-pub mod bank;
 pub mod bitset;
-pub mod dup;
-pub mod gen;
+pub mod clues;
+pub mod gen_it;
 pub mod grid;
 pub mod library;
+pub mod pdf;
 pub mod solver;
 pub mod util;
 pub mod wordlist;

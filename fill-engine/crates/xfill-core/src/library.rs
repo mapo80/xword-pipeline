@@ -22,6 +22,8 @@ pub struct LibEntry {
     pub answer: String,
     pub score: u8,
     pub theme: bool,
+    /// Clue text, filled in from the clue database after selection.
+    pub clue: Option<String>,
 }
 
 pub struct LibGrid {
@@ -96,6 +98,7 @@ fn build_from_parts(
                 answer: ans.clone(),
                 score: *sc,
                 theme: theme_ids.contains(ei),
+                clue: None,
             }
         })
         .collect();
@@ -167,18 +170,35 @@ pub fn distinct_shapes(grids: &[LibGrid]) -> usize {
         .len()
 }
 
-/// Which member(s) of a root-duplicate pair to try banning for a refill
-/// retry, most-disposable first: non-theme members only (theme answers are
-/// locked and can't be banned), lower score first, shorter on ties. Empty if
-/// neither member is a searchable fill entry.
-pub fn dup_ban_targets<'a>(g: &'a LibGrid, a: &str, b: &str) -> Vec<&'a str> {
-    let mut cands: Vec<&LibEntry> = g
-        .entries
-        .iter()
-        .filter(|e| !e.theme && (e.answer == a || e.answer == b))
-        .collect();
-    cands.sort_by_key(|e| (e.score, e.answer.len()));
-    cands.into_iter().map(|e| e.answer.as_str()).collect()
+/// Build the printable form of a library grid (clues taken from entries;
+/// entries without a clue print an empty line).
+pub fn to_pdf_puzzle(g: &LibGrid, title: &str, subtitle: &str) -> crate::pdf::PdfPuzzle {
+    use crate::pdf::PdfClue;
+    let mut numbers: Vec<(usize, usize, u32)> =
+        g.entries.iter().map(|e| (e.row, e.col, e.num)).collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    let list = |dir: char| -> Vec<PdfClue> {
+        let mut v: Vec<PdfClue> = g
+            .entries
+            .iter()
+            .filter(|e| e.dir == dir)
+            .map(|e| PdfClue {
+                num: e.num,
+                text: e.clue.clone().unwrap_or_default(),
+            })
+            .collect();
+        v.sort_by_key(|c| c.num);
+        v
+    };
+    crate::pdf::PdfPuzzle {
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        fill: g.fill.clone(),
+        numbers,
+        across: list('A'),
+        down: list('D'),
+    }
 }
 
 fn esc(s: &str) -> String {
@@ -226,8 +246,9 @@ pub fn write_json(
         s.push_str("      \"entries\": [\n");
         for (ei, e) in g.entries.iter().enumerate() {
             s.push_str(&format!(
-                "        {{\"num\": {}, \"dir\": \"{}\", \"row\": {}, \"col\": {}, \"len\": {}, \"answer\": \"{}\", \"score\": {}, \"theme\": {}}}{}\n",
+                "        {{\"num\": {}, \"dir\": \"{}\", \"row\": {}, \"col\": {}, \"len\": {}, \"answer\": \"{}\", \"score\": {}, \"theme\": {}, \"clue\": {}}}{}\n",
                 e.num, e.dir, e.row, e.col, e.len, esc(&e.answer), e.score, e.theme,
+                e.clue.as_ref().map_or("null".to_string(), |c| format!("\"{}\"", esc(c))),
                 if ei + 1 < g.entries.len() { "," } else { "" }
             ));
         }
@@ -250,19 +271,6 @@ pub fn write_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn entry(answer: &str, score: u8, theme: bool) -> LibEntry {
-        LibEntry {
-            num: 1,
-            dir: 'A',
-            row: 0,
-            col: 0,
-            len: answer.len(),
-            answer: answer.to_string(),
-            score,
-            theme,
-        }
-    }
 
     fn grid(entries: Vec<LibEntry>) -> LibGrid {
         LibGrid {
@@ -323,21 +331,5 @@ mod tests {
             "cap 1 keeps the best only"
         );
         assert_eq!(distinct_shapes(&out), 1);
-    }
-
-    #[test]
-    fn dup_ban_targets_prefers_disposable_member() {
-        let g = grid(vec![
-            entry("ARENA", 60, false),
-            entry("RENA", 50, false),
-            entry("SLAMDUNK", 90, true),
-        ]);
-        // Lower score first, so the junkier member is banned before the keeper.
-        assert_eq!(dup_ban_targets(&g, "ARENA", "RENA"), vec!["RENA", "ARENA"]);
-        // A theme member is locked → only the fill member is bannable.
-        assert_eq!(dup_ban_targets(&g, "SLAMDUNK", "ARENA"), vec!["ARENA"]);
-        // Equal scores tie-break shorter-first.
-        let g = grid(vec![entry("ILLS", 50, false), entry("ILL", 50, false)]);
-        assert_eq!(dup_ban_targets(&g, "ILL", "ILLS"), vec!["ILL", "ILLS"]);
     }
 }

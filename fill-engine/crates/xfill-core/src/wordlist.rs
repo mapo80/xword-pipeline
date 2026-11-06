@@ -10,8 +10,13 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-pub const MAX_LEN: usize = 15;
-pub const MIN_LEN: usize = 3;
+/// Longest entry the engine can index. Raised from 15 (NYT) to 24 for Italian
+/// grids, whose word lists and rectangular layouts carry longer answers.
+pub const MAX_LEN: usize = 24;
+/// Shortest run that counts as an entry. Italian crosswords use 2-letter
+/// answers; a 1-letter run is an unclued cell (it belongs only to the
+/// perpendicular entry), which `grid::Puzzle` already models.
+pub const MIN_LEN: usize = 2;
 
 /// Letters of `s` as 0..25, ignoring any non-alphabetic characters.
 fn normalize_letters(s: &str) -> Vec<u8> {
@@ -47,7 +52,7 @@ fn read_blocklist(path: &Path) -> HashSet<Box<[u8]>> {
 }
 
 /// The blocklist that sits next to the wordlist file (`<dir>/blocklist.txt`).
-fn blocklist_beside(wordlist_path: &str) -> HashSet<Box<[u8]>> {
+pub(crate) fn blocklist_beside(wordlist_path: &str) -> HashSet<Box<[u8]>> {
     let bl = match Path::new(wordlist_path).parent() {
         Some(d) => d.join("blocklist.txt"),
         None => Path::new("blocklist.txt").to_path_buf(),
