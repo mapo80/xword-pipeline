@@ -1,16 +1,13 @@
-//! Shared grid-library artifact: the vetted JSON the daily-puzzle pipeline (clue
-//! writing, scheduling) consumes. Used by both the `library` (themeless) and
-//! `theme` (themed) binaries so they emit an identical schema.
+//! Grid library: the JSON artifact written by the `library` binary (template,
+//! fill, numbered answers with scores and clues) and the selection of the
+//! best fills to keep.
 
 use crate::grid::{Dir, Puzzle};
 use crate::solver::{SolveResult, SolvedFill};
 use std::collections::{HashMap, HashSet};
 
-/// Pipeline default for `select_keepers`' per-shape cap. Four fills of one
-/// template is enough variety that a 5×5 run (whose symmetric shape space is
-/// FIVE templates in total) still produces a full top-20, while at 9×9 and up
-/// shapes are plentiful (~190 distinct per 300 candidates) so the cap rarely
-/// binds. Callers surface this as a tunable; 0 lifts the cap.
+/// Default for `select_keepers`' per-shape cap: at most this many different
+/// fills of one block pattern are kept. 0 lifts the cap.
 pub const DEFAULT_PER_SHAPE: usize = 4;
 
 pub struct LibEntry {
@@ -21,7 +18,6 @@ pub struct LibEntry {
     pub len: usize,
     pub answer: String,
     pub score: u8,
-    pub theme: bool,
     /// Clue text, filled in from the clue database after selection.
     pub clue: Option<String>,
 }
@@ -30,62 +26,35 @@ pub struct LibGrid {
     pub blocks: usize,
     pub mean: f64,
     pub min: u8,
-    pub iffy: usize,
     /// Searched entries under the solver's weak bar (see
-    /// `SolveConfig::weak_bar`) — the gluey tail an editor counts.
+    /// `SolveConfig::weak_bar`).
     pub weak: usize,
-    pub themed: bool,
     pub template: Vec<String>,
     pub fill: Vec<String>,
     pub entries: Vec<LibEntry>,
 }
 
-/// Build a library record from a solve result's primary (best-by-mean) fill.
-/// `theme_ids` are the entry ids that were locked theme answers (empty for
-/// themeless). Returns None if the result isn't a solved fill.
-pub fn build_lib_grid(p: &Puzzle, r: &SolveResult, theme_ids: &HashSet<usize>) -> Option<LibGrid> {
-    let (mean, min, iffy) = match (r.mean_score, r.min_score, r.iffy_count) {
-        (Some(m), Some(mn), Some(i)) => (m, mn, i),
-        _ => return None,
+/// Build a library record from a solve result, preferring the solver's clean
+/// track (fewest weak entries, then mean) over the mean-best fill. Returns
+/// None if the result isn't a solved fill.
+pub fn build_lib_grid(p: &Puzzle, r: &SolveResult) -> Option<LibGrid> {
+    if let Some(c) = &r.clean {
+        return Some(from_fill(p, c));
+    }
+    let f = SolvedFill {
+        letters: r.letters.clone()?,
+        mean_score: r.mean_score?,
+        min_score: r.min_score?,
+        weak_count: r.weak_count.unwrap_or(0),
+        fill: r.fill.clone()?,
     };
-    let weak = r.weak_count.unwrap_or(0);
-    let (letters, fill) = match (r.letters.as_deref(), r.fill.as_ref()) {
-        (Some(l), Some(f)) => (l, f),
-        _ => return None,
-    };
-    Some(build_from_parts(
-        p, letters, mean, min, iffy, weak, fill, theme_ids,
-    ))
+    Some(from_fill(p, &f))
 }
 
-/// Build a library record from a specific fill (e.g. the solver's `clean`
-/// alternative when it passes the caller's keep gates).
-pub fn build_lib_grid_from(p: &Puzzle, f: &SolvedFill, theme_ids: &HashSet<usize>) -> LibGrid {
-    build_from_parts(
-        p,
-        &f.letters,
-        f.mean_score,
-        f.min_score,
-        f.iffy_count,
-        f.weak_count,
-        &f.fill,
-        theme_ids,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_from_parts(
-    p: &Puzzle,
-    letters: &[Option<u8>],
-    mean: f64,
-    min: u8,
-    iffy: usize,
-    weak: usize,
-    fill: &[(usize, String, u8)],
-    theme_ids: &HashSet<usize>,
-) -> LibGrid {
+fn from_fill(p: &Puzzle, f: &SolvedFill) -> LibGrid {
     let nums = p.number_entries();
-    let mut entries: Vec<LibEntry> = fill
+    let mut entries: Vec<LibEntry> = f
+        .fill
         .iter()
         .map(|(ei, ans, sc)| {
             let e = &p.entries[*ei];
@@ -97,7 +66,6 @@ fn build_from_parts(
                 len: e.len,
                 answer: ans.clone(),
                 score: *sc,
-                theme: theme_ids.contains(ei),
                 clue: None,
             }
         })
@@ -105,14 +73,12 @@ fn build_from_parts(
     entries.sort_by_key(|g| (g.num, g.dir));
     LibGrid {
         blocks: p.block_count(),
-        mean,
-        min,
-        iffy,
-        weak,
-        themed: !theme_ids.is_empty(),
+        mean: f.mean_score,
+        min: f.min_score,
+        weak: f.weak_count,
         template: p.render(None).lines().map(str::to_string).collect(),
         fill: p
-            .render(Some(letters))
+            .render(Some(&f.letters))
             .lines()
             .map(str::to_string)
             .collect(),
@@ -201,8 +167,21 @@ pub fn to_pdf_puzzle(g: &LibGrid, title: &str, subtitle: &str) -> crate::pdf::Pd
     }
 }
 
+/// JSON string escaping (quotes, backslash, control characters).
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn json_arr(rows: &[String]) -> String {
@@ -212,31 +191,25 @@ fn json_arr(rows: &[String]) -> String {
         .join(", ")
 }
 
-/// Serialize a library to JSON. `themes` lists the theme answers (empty for a
-/// themeless library) and is recorded in the metadata.
+/// Serialize a library to JSON.
 pub fn write_json(
     path: &str,
     grids: &[LibGrid],
     wordlist: &str,
     target_blocks: usize,
-    themes: &[String],
 ) -> std::io::Result<()> {
     let mut s = String::new();
     s.push_str("{\n");
     s.push_str(&format!("  \"wordlist\": \"{}\",\n", esc(wordlist)));
     s.push_str(&format!("  \"target_blocks\": {target_blocks},\n"));
-    s.push_str(&format!("  \"themed\": {},\n", !themes.is_empty()));
-    s.push_str(&format!("  \"themes\": [{}],\n", json_arr(themes)));
     s.push_str(&format!("  \"count\": {},\n", grids.len()));
     s.push_str("  \"grids\": [\n");
     for (gi, g) in grids.iter().enumerate() {
         s.push_str("    {\n");
         s.push_str(&format!("      \"id\": {gi},\n"));
         s.push_str(&format!("      \"blocks\": {},\n", g.blocks));
-        s.push_str(&format!("      \"themed\": {},\n", g.themed));
         s.push_str(&format!("      \"mean_score\": {:.2},\n", g.mean));
         s.push_str(&format!("      \"min_score\": {},\n", g.min));
-        s.push_str(&format!("      \"iffy\": {},\n", g.iffy));
         s.push_str(&format!("      \"weak\": {},\n", g.weak));
         s.push_str(&format!(
             "      \"template\": [{}],\n",
@@ -246,8 +219,8 @@ pub fn write_json(
         s.push_str("      \"entries\": [\n");
         for (ei, e) in g.entries.iter().enumerate() {
             s.push_str(&format!(
-                "        {{\"num\": {}, \"dir\": \"{}\", \"row\": {}, \"col\": {}, \"len\": {}, \"answer\": \"{}\", \"score\": {}, \"theme\": {}, \"clue\": {}}}{}\n",
-                e.num, e.dir, e.row, e.col, e.len, esc(&e.answer), e.score, e.theme,
+                "        {{\"num\": {}, \"dir\": \"{}\", \"row\": {}, \"col\": {}, \"len\": {}, \"answer\": \"{}\", \"score\": {}, \"clue\": {}}}{}\n",
+                e.num, e.dir, e.row, e.col, e.len, esc(&e.answer), e.score,
                 e.clue.as_ref().map_or("null".to_string(), |c| format!("\"{}\"", esc(c))),
                 if ei + 1 < g.entries.len() { "," } else { "" }
             ));
@@ -277,9 +250,7 @@ mod tests {
             blocks: 0,
             mean: 0.0,
             min: 0,
-            iffy: 0,
             weak: 0,
-            themed: false,
             template: Vec::new(),
             fill: Vec::new(),
             entries,

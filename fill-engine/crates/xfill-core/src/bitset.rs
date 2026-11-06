@@ -2,7 +2,7 @@
 //! for constraint propagation, `count_ones` for MRV, `iter_ones` for
 //! score-ordered candidate enumeration.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bitset {
     words: Box<[u64]>,
     nbits: usize,
@@ -65,6 +65,44 @@ impl Bitset {
     }
 
     #[inline]
+    /// Do `self` and `other` share a set bit below index `limit`?
+    pub fn intersects_below(&self, other: &Bitset, limit: usize) -> bool {
+        let full = limit / 64;
+        for i in 0..full.min(self.words.len()) {
+            if self.words[i] & other.words[i] != 0 {
+                return true;
+            }
+        }
+        let rem = limit % 64;
+        if rem > 0 && full < self.words.len() {
+            let mask = (1u64 << rem) - 1;
+            return self.words[full] & other.words[full] & mask != 0;
+        }
+        false
+    }
+
+    /// Number of bits set in both `self` and `other` below index `limit`.
+    pub fn count_and_below(&self, other: &Bitset, limit: usize) -> u32 {
+        let full = (limit / 64).min(self.words.len());
+        let mut n: u32 = self.words[..full]
+            .iter()
+            .zip(other.words[..full].iter())
+            .map(|(a, b)| (a & b).count_ones())
+            .sum();
+        let rem = limit % 64;
+        if rem > 0 && full < self.words.len() {
+            let mask = (1u64 << rem) - 1;
+            n += (self.words[full] & other.words[full] & mask).count_ones();
+        }
+        n
+    }
+
+    pub fn or_assign(&mut self, other: &Bitset) {
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a |= *b;
+        }
+    }
+
     pub fn count_ones(&self) -> u32 {
         self.words.iter().map(|w| w.count_ones()).sum()
     }
@@ -136,6 +174,48 @@ impl Iterator for OnesIter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersects_below_respects_limit() {
+        let mut a = Bitset::zeros(200);
+        let mut b = Bitset::zeros(200);
+        a.set(130);
+        b.set(130);
+        assert!(a.intersects_below(&b, 200));
+        assert!(a.intersects_below(&b, 131));
+        assert!(!a.intersects_below(&b, 130), "bit 130 is not below 130");
+        assert!(!a.intersects_below(&b, 64));
+        a.set(5);
+        b.set(5);
+        assert!(a.intersects_below(&b, 6));
+        assert!(!Bitset::zeros(10).intersects_below(&Bitset::ones(10), 10));
+    }
+
+    #[test]
+    fn count_and_below_counts_common_bits_under_limit() {
+        let mut a = Bitset::zeros(200);
+        let mut b = Bitset::zeros(200);
+        for i in [3, 70, 150, 199] {
+            a.set(i);
+            b.set(i);
+        }
+        a.set(10);
+        assert_eq!(a.count_and_below(&b, 200), 4);
+        assert_eq!(a.count_and_below(&b, 150), 2);
+        assert_eq!(a.count_and_below(&b, 151), 3);
+        assert_eq!(a.count_and_below(&b, 0), 0);
+    }
+
+    #[test]
+    fn or_assign_unions() {
+        let mut a = Bitset::zeros(130);
+        let mut b = Bitset::zeros(130);
+        a.set(1);
+        b.set(129);
+        a.or_assign(&b);
+        assert!(a.get(1) && a.get(129));
+        assert_eq!(a.count_ones(), 2);
+    }
 
     #[test]
     fn ones_zeros_count() {

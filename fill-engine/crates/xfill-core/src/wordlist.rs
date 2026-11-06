@@ -1,5 +1,6 @@
-//! Scored wordlist (Crossword Nexus `WORD;score` format) with per-length
-//! compatibility masks for bitset-based constraint propagation.
+//! Scored wordlist with per-length compatibility masks for bitset-based
+//! constraint propagation. Built from `WORD;score` lines (the clue CSV loader
+//! in `clues` produces them in memory).
 //!
 //! Within each length, words are sorted by score DESCENDING, so word index 0 is
 //! the highest-quality entry. This makes score-ordered enumeration (iterate set
@@ -58,29 +59,6 @@ pub(crate) fn blocklist_beside(wordlist_path: &str) -> HashSet<Box<[u8]>> {
         None => Path::new("blocklist.txt").to_path_buf(),
     };
     read_blocklist(&bl)
-}
-
-/// Overlay files that sit next to the wordlist, HIGHEST PRIORITY FIRST. Each
-/// uses the same `WORD;SCORE` format as the main dict and is prepended to it,
-/// so the first-occurrence-wins dedup in `from_str_filtered` resolves:
-///
-///   supplemental (hand edits, absolute — may raise OR lower)
-///     > rescores-local (local; gitignored)
-///     > rescores (usage-evidence floors from the xd corpus; generated)
-///     > main dict (upstream snapshot, never edited)
-///
-/// The blocklist still kills a word regardless of any overlay. See
-/// data/README.md for the full layering story.
-const OVERLAYS: [&str; 3] = ["supplemental.txt", "rescores-local.txt", "rescores.txt"];
-
-/// Raw text of an overlay file next to the wordlist (same `WORD;SCORE` format
-/// as the main dict). Missing file → empty string.
-fn overlay_beside(wordlist_path: &str, name: &str) -> String {
-    let p = match Path::new(wordlist_path).parent() {
-        Some(d) => d.join(name),
-        None => Path::new(name).to_path_buf(),
-    };
-    fs::read_to_string(&p).unwrap_or_default()
 }
 
 pub struct LenData {
@@ -143,52 +121,6 @@ pub struct Wordlist {
 }
 
 impl Wordlist {
-    /// Load the wordlist, automatically applying:
-    ///   * a `blocklist.txt` next to the wordlist file (excludes regardless
-    ///     of score — so a mis-scored junk word can't slip into a fill), and
-    ///   * the `OVERLAYS` next to the wordlist (`supplemental.txt`,
-    ///     `rescores-local.txt`, `rescores.txt`) — each adds entries and
-    ///     overrides scores of anything below it in the layering.
-    ///
-    /// Blocklist still wins if a word appears in any overlay and the
-    /// blocklist.
-    pub fn load(path: &str, min_score: u8) -> std::io::Result<Wordlist> {
-        let text = fs::read_to_string(path)?;
-        let blocklist = blocklist_beside(path);
-        if !blocklist.is_empty() {
-            eprintln!("blocklist: excluding {} word(s)", blocklist.len());
-        }
-        // Overlays are PREPENDED highest-priority-first so the
-        // first-occurrence-wins dedup in from_str_filtered gives each layer
-        // priority over everything below it (see OVERLAYS).
-        let mut parts: Vec<String> = Vec::new();
-        for name in OVERLAYS {
-            let overlay = overlay_beside(path, name);
-            if overlay.is_empty() {
-                continue;
-            }
-            let n_entries = overlay
-                .lines()
-                .filter(|l| {
-                    let t = l.trim();
-                    !t.is_empty() && !t.starts_with('#')
-                })
-                .count();
-            eprintln!(
-                "{}: {} entries loaded",
-                name.trim_end_matches(".txt"),
-                n_entries
-            );
-            parts.push(overlay);
-        }
-        parts.push(text);
-        Ok(Self::from_str_filtered(
-            &parts.join("\n"),
-            min_score,
-            &blocklist,
-        ))
-    }
-
     pub fn from_str(text: &str, min_score: u8) -> Wordlist {
         Self::from_str_filtered(text, min_score, &HashSet::new())
     }
@@ -233,12 +165,7 @@ impl Wordlist {
             if blocklist.contains(&boxed) {
                 continue;
             }
-            // First occurrence RESOLVES the word's score (overlays are
-            // prepended highest-priority-first), so register it in `seen`
-            // before the min_score cut: a high-priority entry below the
-            // cutoff must EXCLUDE the word, not defer to a lower layer
-            // (e.g. a hand-lowered supplemental score suppresses a rescore
-            // floor rather than being resurrected by it).
+            // First occurrence wins; a later duplicate never overrides it.
             if seen.contains(&boxed) {
                 continue;
             }
@@ -285,6 +212,28 @@ impl Wordlist {
     #[inline]
     pub fn len_data(&self, len: usize) -> &LenData {
         &self.by_len[len]
+    }
+
+    /// Length of the longest word in the list (0 if empty).
+    pub fn longest(&self) -> usize {
+        self.by_len.iter().rposition(|l| l.n > 0).unwrap_or(0)
+    }
+
+    /// Entry lengths used by `p` for which the list has no words, with the
+    /// number of entries of each such length (ascending by length).
+    pub fn missing_lengths(&self, p: &crate::grid::Puzzle) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for e in &p.entries {
+            if e.len < self.by_len.len() && self.by_len[e.len].n > 0 {
+                continue;
+            }
+            match out.iter_mut().find(|(l, _)| *l == e.len) {
+                Some((_, c)) => *c += 1,
+                None => out.push((e.len, 1)),
+            }
+        }
+        out.sort_unstable();
+        out
     }
 }
 
@@ -360,6 +309,18 @@ FOO;25
     }
 
     #[test]
+    fn longest_and_missing_lengths() {
+        let wl = tiny(); // kept lengths: 3, 5, 6
+        assert_eq!(wl.longest(), 6);
+        let p = crate::grid::Puzzle::from_template("....#...\n");
+        // slots: 4 (missing) and 3 (present)
+        assert_eq!(wl.missing_lengths(&p), vec![(4, 1)]);
+        let p = crate::grid::Puzzle::from_template("...\n");
+        assert!(wl.missing_lengths(&p).is_empty());
+        assert_eq!(Wordlist::from_str("", 0).longest(), 0);
+    }
+
+    #[test]
     fn tier_cutoff_works() {
         let wl = tiny();
         let l5 = wl.len_data(5);
@@ -368,98 +329,5 @@ FOO;25
         assert_eq!(l5.tier_cutoff(80), 2); // ABBEY, EDGAR
         assert_eq!(l5.tier_cutoff(40), 2); // both
         assert_eq!(l5.tier_cutoff(95), 0);
-    }
-
-    /// Supplemental entries (modeled as text prepended to the main dict) are
-    /// included in the loaded wordlist with their declared scores.
-    #[test]
-    fn supplemental_adds_new_entries() {
-        // Supplemental adds WORDLE (length 6) that main doesn't have.
-        let supplemental = "WORDLE;75\n";
-        let main = "ABBEY;90\nCAT;75\n";
-        let combined = format!("{}\n{}", supplemental, main);
-        let wl = Wordlist::from_str(&combined, 40);
-        let l6: Vec<String> = (0..wl.len_data(6).n)
-            .map(|i| wl.len_data(6).word_string(i))
-            .collect();
-        assert!(
-            l6.contains(&"WORDLE".to_string()),
-            "supplemental WORDLE should be loaded"
-        );
-    }
-
-    /// When both supplemental and main declare the same word with different
-    /// scores, supplemental's score wins (it's prepended → seen first).
-    #[test]
-    fn supplemental_score_overrides_main() {
-        // Both files declare CAT. Supplemental's score 95 should be the one kept.
-        let supplemental = "CAT;95\n";
-        let main = "CAT;75\nDOG;75\n";
-        let combined = format!("{}\n{}", supplemental, main);
-        let wl = Wordlist::from_str(&combined, 40);
-        let l3 = wl.len_data(3);
-        let i_cat = l3
-            .index_of(&normalize_letters("cat"))
-            .expect("CAT must be present");
-        assert_eq!(
-            l3.scores[i_cat], 95,
-            "supplemental's CAT;95 must win over main's CAT;75"
-        );
-    }
-
-    /// Blocklist still excludes entries even when supplemental tries to add
-    /// them — blocklist is the strongest signal.
-    #[test]
-    fn blocklist_overrides_supplemental() {
-        let supplemental = "BANNED;90\n";
-        let main = "CAT;75\n";
-        let combined = format!("{}\n{}", supplemental, main);
-        let mut block: HashSet<Box<[u8]>> = HashSet::new();
-        block.insert(normalize_letters("banned").into_boxed_slice());
-        let wl = Wordlist::from_str_filtered(&combined, 40, &block);
-        let l6: Vec<String> = (0..wl.len_data(6).n)
-            .map(|i| wl.len_data(6).word_string(i))
-            .collect();
-        assert!(
-            !l6.contains(&"BANNED".to_string()),
-            "blocklist must exclude even supplemental entries"
-        );
-    }
-
-    /// End-to-end `load()` layering through real beside-files:
-    /// supplemental > rescores-local > rescores > dict, blocklist supreme,
-    /// min_score applied to the RESOLVED score (so a floor makes a word
-    /// loadable, and a hand-lowered supplemental score can exclude one).
-    #[test]
-    fn load_applies_overlay_layering() {
-        let dir = std::env::temp_dir().join(format!("xfill-overlays-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dict = dir.join("dict.txt");
-        std::fs::write(&dict, "ISSA;44\nETUI;30\nOREO;90\nJUNK;80\n").unwrap();
-        std::fs::write(dir.join("rescores.txt"), "# floors\nISSA;60\nETUI;65\n").unwrap();
-        std::fs::write(dir.join("rescores-local.txt"), "ISSA;62\n").unwrap();
-        std::fs::write(dir.join("supplemental.txt"), "ETUI;40\n").unwrap();
-        std::fs::write(dir.join("blocklist.txt"), "JUNK\n").unwrap();
-
-        let wl = Wordlist::load(dict.to_str().unwrap(), 50).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-
-        let l4 = wl.len_data(4);
-        let words: Vec<String> = (0..l4.n).map(|i| l4.word_string(i)).collect();
-        assert!(words.contains(&"OREO".to_string()), "dict word kept");
-        assert!(
-            words.contains(&"ISSA".to_string()),
-            "rescore floor lifts ISSA above the min_score cutoff"
-        );
-        assert!(
-            !words.contains(&"ETUI".to_string()),
-            "hand-lowered supplemental score (40) beats the rescore floor (65)"
-        );
-        assert!(!words.contains(&"JUNK".to_string()), "blocklist supreme");
-        let issa = l4.index_of(&normalize_letters("ISSA")).unwrap();
-        assert_eq!(
-            l4.scores[issa], 62,
-            "rescores-local (62) outranks rescores (60) and dict (44)"
-        );
     }
 }

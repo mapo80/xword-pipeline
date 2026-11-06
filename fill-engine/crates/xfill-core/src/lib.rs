@@ -8,6 +8,7 @@
 //! - [`solver`]: DFS solver (MRV + score order + restarts)
 //! - [`library`]: keeper selection + JSON artifact
 
+pub mod bench;
 pub mod bitset;
 pub mod clues;
 pub mod gen_it;
@@ -19,5 +20,5 @@ pub mod util;
 pub mod wordlist;
 
 pub use grid::Puzzle;
-pub use solver::{Lock, SolveConfig, SolveResult, Solver};
+pub use solver::{solve_portfolio, Analysis, Lock, SolveConfig, SolveResult, Solver};
 pub use wordlist::Wordlist;

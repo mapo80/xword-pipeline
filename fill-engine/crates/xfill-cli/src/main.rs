@@ -4,9 +4,9 @@
 
 use std::process::ExitCode;
 use std::time::Instant;
-use xfill_core::clues::load_wordlist;
+use xfill_core::clues::load_clue_csv;
 use xfill_core::grid::Dir;
-use xfill_core::{Lock, Puzzle, SolveConfig, SolveResult, Solver};
+use xfill_core::{Lock, Puzzle, SolveConfig, Solver};
 
 struct Args {
     template: String,
@@ -19,6 +19,7 @@ struct Args {
     boxed: bool,
     workers: usize,
     locks: Vec<Lock>,
+    analyze: bool,
 }
 
 /// Parse a `--lock` value "ROW,COL,DIR,ANSWER" (DIR is A/Across or D/Down).
@@ -49,11 +50,14 @@ fn parse_args() -> Result<Args, String> {
         min_score: 0,
         time_limit: 30.0,
         seed: 0,
-        tiers: vec![50, 58, 63],
+        tiers: SolveConfig::default().tiers,
         first: false,
         boxed: false,
-        workers: 1,
+        workers: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
         locks: Vec::new(),
+        analyze: false,
     };
     let mut it = std::env::args().skip(1);
     let mut got_template = false;
@@ -91,6 +95,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--first" => a.first = true,
             "--boxed" => a.boxed = true,
+            "--analyze" => a.analyze = true,
+            // solver variants: validated by SolveConfig::with_args in main
+            f if xfill_core::solver::SOLVER_FLAGS.contains(&f) => {
+                it.next();
+            }
             "--workers" => {
                 a.workers = it
                     .next()
@@ -111,7 +120,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if !got_template {
-        return Err("usage: xfill <template> [--wordlist PATH] [--min-score N] [--time SECS] [--seed N] [--tiers 50,58,63] [--first] [--boxed] [--workers N] [--lock ROW,COL,DIR,ANSWER ...]".into());
+        return Err("usage: xfill <template> [--wordlist PATH] [--min-score N] [--time SECS] [--seed N] [--tiers 50,58,63] [--first] [--boxed] [--workers N] [--lock ROW,COL,DIR,ANSWER ...] [--analyze]".into());
     }
     Ok(a)
 }
@@ -126,7 +135,7 @@ fn main() -> ExitCode {
     };
 
     let t = Instant::now();
-    let wl = match load_wordlist(&args.wordlist, args.min_score) {
+    let wl = match load_clue_csv(&args.wordlist, args.min_score) {
         Ok((w, _clues)) => w,
         Err(e) => {
             eprintln!("failed to load wordlist {}: {e}", args.wordlist);
@@ -160,22 +169,43 @@ fn main() -> ExitCode {
         p.orphan_cells()
     );
 
-    let cfg = SolveConfig {
+    let cli: Vec<String> = std::env::args().skip(1).collect();
+    let cfg = match (SolveConfig {
         time_limit_s: args.time_limit,
         tiers: args.tiers,
         seed: args.seed,
         stop_on_first: args.first,
-        // Italian scores start at 50 (one clue in the database): every word
-        // is admissible; single-clue words are the "weak" tail.
-        clean_floor: 50,
-        weak_bar: 58,
         ..Default::default()
+    })
+    .with_args(&cli)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
     };
+    eprintln!("solver: {}", cfg.describe());
 
     // Validate theme locks once up front (clear error if a spec is wrong).
     if let Err(e) = Solver::with_locks(&p, &wl, &args.locks) {
         eprintln!("lock error: {e}");
         return ExitCode::FAILURE;
+    }
+    // Slots whose length has no dictionary words can't be filled (locked
+    // answers are exempt: they need not be in the dictionary).
+    let locked_lens: Vec<usize> = args
+        .locks
+        .iter()
+        .filter_map(|l| p.find_entry(l.row, l.col, l.dir))
+        .map(|ei| p.entries[ei].len)
+        .collect();
+    for (len, n) in wl.missing_lengths(&p) {
+        let unlocked = n - locked_lens.iter().filter(|&&l| l == len).count();
+        if unlocked > 0 {
+            eprintln!("error: no dictionary words of length {len} (needed by {unlocked} slot(s))");
+            return ExitCode::FAILURE;
+        }
     }
     if !args.locks.is_empty() {
         eprintln!(
@@ -185,68 +215,26 @@ fn main() -> ExitCode {
         );
     }
 
-    // Single grid, optional parallel best-of: each worker runs an independent
-    // restart search with a distinct seed; we keep the best fill by mean score
-    // and report the combined node/restart totals.
-    let locks = &args.locks;
-    let r = if args.workers <= 1 {
-        Solver::with_locks(&p, &wl, locks).unwrap().solve(&cfg)
-    } else {
-        let p = &p;
-        let wl = &wl;
-        let cfg = &cfg;
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..args.workers)
-                .map(|k| {
-                    let mut cfg_k = cfg.clone();
-                    cfg_k.seed = cfg
-                        .seed
-                        .wrapping_add((k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                    s.spawn(move || Solver::with_locks(p, wl, locks).unwrap().solve(&cfg_k))
-                })
-                .collect();
-            let mut total_nodes = 0u64;
-            let mut total_restarts = 0u64;
-            let mut best: Option<SolveResult> = None;
-            for h in handles {
-                let mut res = h.join().unwrap();
-                total_nodes += res.nodes;
-                total_restarts += res.restarts;
-                let take = match &best {
-                    None => true,
-                    Some(b) => {
-                        res.reason == "solved"
-                            && b.mean_score
-                                .is_none_or(|bm| res.mean_score.is_some_and(|m| m > bm))
-                    }
-                };
-                // The best clean alternative may live in a losing worker —
-                // merge it so the combined result carries both maxima.
-                if take {
-                    if let Some(bc) = best.take().and_then(|b| b.clean) {
-                        if res
-                            .clean
-                            .as_ref()
-                            .is_none_or(|rc| bc.mean_score > rc.mean_score)
-                        {
-                            res.clean = Some(bc);
-                        }
-                    }
-                    best = Some(res);
-                } else if let (Some(rc), Some(b)) = (res.clean, best.as_mut()) {
-                    if b.clean
-                        .as_ref()
-                        .is_none_or(|bc| rc.mean_score > bc.mean_score)
-                    {
-                        b.clean = Some(rc);
-                    }
-                }
-            }
-            let mut r = best.unwrap();
-            r.nodes = total_nodes;
-            r.restarts = total_restarts;
-            r
-        })
+    if args.analyze {
+        return print_analysis(
+            &p,
+            &Solver::with_locks(&p, &wl, &args.locks).unwrap().analyze(),
+        );
+    }
+
+    // Parallel portfolio of independent searches (distinct seeds); with
+    // --first the first worker to solve stops the others.
+    eprintln!(
+        "solving with {} worker{}",
+        args.workers,
+        if args.workers == 1 { "" } else { "s" }
+    );
+    let r = match xfill_core::solve_portfolio(&p, &wl, &args.locks, &cfg, args.workers) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("lock error: {e}");
+            return ExitCode::FAILURE;
+        }
     };
 
     println!();
@@ -261,22 +249,15 @@ fn main() -> ExitCode {
         "reason: {}  nodes: {}  restarts: {}  elapsed: {:.3}s  ({:.0} nodes/s)",
         r.reason, r.nodes, r.restarts, r.elapsed_s, rate
     );
-    if let (Some(mean), Some(min), Some(iffy), Some(fill)) =
-        (r.mean_score, r.min_score, r.iffy_count, r.fill.as_ref())
-    {
+    if let (Some(mean), Some(min), Some(fill)) = (r.mean_score, r.min_score, r.fill.as_ref()) {
         println!(
-            "mean score: {:.1}  min: {}  iffy(<50): {}/{}",
+            "mean score: {:.1}  min: {}  weak(<{}): {}/{}",
             mean,
             min,
-            iffy,
+            cfg.weak_bar,
+            r.weak_count.unwrap_or(0),
             fill.len()
         );
-        if let Some(c) = r.clean.as_ref() {
-            println!(
-                "clean alternative (min {} >= floor {}): mean {:.1}",
-                c.min_score, cfg.clean_floor, c.mean_score
-            );
-        }
         let mut weak: Vec<_> = fill.clone();
         weak.sort_by_key(|(_, _, s)| *s);
         println!("\nweakest entries:");
@@ -294,4 +275,53 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     ExitCode::FAILURE
+}
+
+/// Print what the grid allows without searching; success iff feasible.
+fn print_analysis(p: &Puzzle, a: &xfill_core::Analysis) -> ExitCode {
+    println!(
+        "analysis: {}",
+        if a.feasible {
+            "feasible"
+        } else {
+            "NOT feasible"
+        }
+    );
+    for &e in &a.impossible {
+        let en = &p.entries[e];
+        let d = if en.dir == xfill_core::grid::Dir::Across {
+            "A"
+        } else {
+            "D"
+        };
+        println!("impossible: {d}{} r{}c{}", en.len, en.row, en.col);
+    }
+    if !a.forced.is_empty() {
+        let f: Vec<String> = a
+            .forced
+            .iter()
+            .map(|&(r, c, l)| format!("r{r}c{c}={}", l as char))
+            .collect();
+        println!("forced: {}", f.join(" "));
+    }
+    // per cell: the letter if only one is possible, else how many (+ = 10+)
+    println!("letters still possible per cell:");
+    let mut grid = vec![vec!['#'; p.cols]; p.rows];
+    for (cid, &m) in a.cell_letters.iter().enumerate() {
+        let (r, c) = p.cell_rc[cid];
+        grid[r][c] = match m.count_ones() {
+            0 => '0',
+            1 => (b'A' + m.trailing_zeros() as u8) as char,
+            n if n < 10 => char::from_digit(n, 10).unwrap(),
+            _ => '+',
+        };
+    }
+    for row in grid {
+        println!("{}", row.into_iter().collect::<String>());
+    }
+    if a.feasible {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }

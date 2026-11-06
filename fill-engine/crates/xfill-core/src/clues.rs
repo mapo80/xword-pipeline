@@ -251,17 +251,6 @@ pub fn load_clue_csv(path: &str, min_score: u8) -> std::io::Result<(Wordlist, Cl
     Ok((wl, ClueDb { clues }))
 }
 
-/// Load any supported word source: a `.csv` clue file (wordlist + clue
-/// database) or a scored `WORD;score` dict (wordlist only, no clues).
-pub fn load_wordlist(path: &str, min_score: u8) -> std::io::Result<(Wordlist, Option<ClueDb>)> {
-    if path.to_ascii_lowercase().ends_with(".csv") {
-        let (wl, db) = load_clue_csv(path, min_score)?;
-        Ok((wl, Some(db)))
-    } else {
-        Ok((Wordlist::load(path, min_score)?, None))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +333,32 @@ mod tests {
             clues: parse_clue_csv(b"ACA,Un\n"),
         };
         assert_eq!(db.pick_clue("ACA", |_| 0).as_deref(), Some("Un"));
+    }
+
+    #[test]
+    fn load_clue_csv_scores_and_honors_blocklist() {
+        let dir = std::env::temp_dir().join(format!("xfill-clues-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("db.csv");
+        std::fs::write(
+            &csv,
+            "MARE,Distesa\nMARE,Acqua salata\nREMO,Pagaia\nBRUTTA,Esclusa\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("blocklist.txt"), "# no\nbrutta\n").unwrap();
+        let (wl, db) = load_clue_csv(csv.to_str().unwrap(), 0).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let l4 = wl.len_data(4);
+        let mare = l4.index_of(&[12, 0, 17, 4]).expect("MARE loaded");
+        assert_eq!(l4.scores[mare], score_from_clue_count(2));
+        assert_eq!(
+            wl.len_data(6).n,
+            0,
+            "blocklisted word excluded from the fill"
+        );
+        assert_eq!(db.len(), 3, "clue database keeps every answer");
+        assert!(!db.is_empty());
+        assert!(load_clue_csv("/nonexistent/x.csv", 0).is_err());
     }
 
     #[test]
