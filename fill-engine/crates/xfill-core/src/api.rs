@@ -324,6 +324,8 @@ pub struct Plan {
     pub solve: SolveConfig,
     /// Patterns to generate at most.
     pub candidates: usize,
+    /// Generator tries per pattern (each a budgeted search).
+    pub gen_tries: usize,
     /// Quality filters on a filled pattern.
     pub min_mean: f64,
     pub max_weak: usize,
@@ -333,6 +335,13 @@ pub struct Plan {
     pub threads: usize,
     pub seed: u64,
 }
+
+/// Generator tries per pattern in the API (the `library` command keeps 50).
+pub const API_GEN_TRIES: usize = 5;
+
+/// Generator calls in a row without a pattern after which, if none was
+/// found at all, the constraints are taken as impossible.
+pub const GIVE_UP_MISSES: usize = 3;
 
 /// Generated patterns with their fill seeds.
 pub struct Patterns {
@@ -359,6 +368,7 @@ pub fn generate_patterns(wl: &Wordlist, plan: &Plan, cancel: &CancelFlag) -> Pat
     let mut seen = HashSet::new();
     let mut infeasible = 0usize;
     let max_tries = plan.candidates.saturating_mul(20).max(200);
+    let mut misses = 0usize;
     while jobs.len() < plan.candidates && tries < max_tries {
         if cancel.load(Ordering::Relaxed) {
             return Patterns {
@@ -370,9 +380,16 @@ pub fn generate_patterns(wl: &Wordlist, plan: &Plan, cancel: &CancelFlag) -> Pat
         }
         tries += 1;
         let jseed = rng.next_u64();
-        let Some(tpl) = generate_it(&gen, &mut rng, 50) else {
+        let Some(tpl) = generate_it(&gen, &mut rng, plan.gen_tries) else {
+            // each call already made `gen_tries` tries: a few failures in a row
+            // with nothing found mean no pattern fits the constraints
+            misses += 1;
+            if misses >= GIVE_UP_MISSES && jobs.is_empty() {
+                break;
+            }
             continue;
         };
+        misses = 0;
         let p = Puzzle::from_template_with_rebus(&tpl, &wl.rebus);
         // every entry length must exist in the word list
         if p.orphan_cells() > 0 || p.entries.iter().any(|e| wl.len_data(e.len).n == 0) {
@@ -613,6 +630,7 @@ pub fn plan_for(wl: &Wordlist, req: &GenerateRequest) -> Result<(Plan, usize), S
             gen,
             solve,
             candidates: req.candidates,
+            gen_tries: API_GEN_TRIES,
             min_mean: req.min_mean,
             max_weak: req.max_weak.unwrap_or(usize::MAX),
             stop_after: req.pool,
@@ -1338,5 +1356,21 @@ mod tests {
         let r = validate(&v);
         assert!(r.valid);
         assert!(r.warnings.iter().any(|w| w.code == "repeated_word"));
+    }
+
+    /// A request with no possible pattern gives up quickly instead of
+    /// spending every generator try on it.
+    #[test]
+    fn hopeless_patterns_give_up_quickly() {
+        let short: String = csv()
+            .lines()
+            .filter(|l| l.split(',').next().is_some_and(|w| w.len() <= 4))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let d = Dictionary::from_csv_bytes(short.as_bytes()).unwrap();
+        let t = Instant::now();
+        let r = generate(&d, &small(9, 9), &cancel_flag());
+        assert_eq!(r.status, Status::NoGrid);
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     }
 }

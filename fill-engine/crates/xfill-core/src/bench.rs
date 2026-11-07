@@ -269,6 +269,100 @@ pub fn format_table(rows: &[SpecSummary]) -> String {
     s
 }
 
+/// Theme density of one format over several seeds (see [`theme_density`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThemeRow {
+    pub format: String,
+    pub runs: usize,
+    /// Runs that produced a grid.
+    pub ok: usize,
+    /// Theme words per produced grid: average, min, max.
+    pub theme_avg: f64,
+    pub theme_min: usize,
+    pub theme_max: usize,
+    /// Entries per produced grid, on average.
+    pub entries_avg: f64,
+    /// Mean word score and weak entries per produced grid, on average.
+    pub score_avg: f64,
+    pub weak_avg: f64,
+    /// Wall time per run, on average (seconds).
+    pub secs_avg: f64,
+}
+
+/// Generate `base` at each of `formats` (rows, cols) once per seed and
+/// measure how many theme words the grids hold.
+pub fn theme_density(
+    dict: &crate::api::Dictionary,
+    base: &crate::api::GenerateRequest,
+    formats: &[(usize, usize)],
+    seeds: &[u64],
+) -> Vec<ThemeRow> {
+    let cancel = crate::api::cancel_flag();
+    formats
+        .iter()
+        .map(|&(rows, cols)| {
+            let mut ok = Vec::new();
+            let mut secs = 0.0;
+            for &seed in seeds {
+                let req = crate::api::GenerateRequest {
+                    rows,
+                    cols,
+                    seed,
+                    clues: false,
+                    ..base.clone()
+                };
+                let t = std::time::Instant::now();
+                let r = crate::api::generate(dict, &req, &cancel);
+                secs += t.elapsed().as_secs_f64();
+                if r.status == crate::api::Status::Ok {
+                    ok.push(r);
+                }
+            }
+            let avg = |f: &dyn Fn(&crate::api::GenerateResult) -> f64| {
+                if ok.is_empty() {
+                    0.0
+                } else {
+                    ok.iter().map(f).sum::<f64>() / ok.len() as f64
+                }
+            };
+            ThemeRow {
+                format: format!("{rows}x{cols}"),
+                runs: seeds.len(),
+                ok: ok.len(),
+                theme_avg: avg(&|r| r.theme_count as f64),
+                theme_min: ok.iter().map(|r| r.theme_count).min().unwrap_or(0),
+                theme_max: ok.iter().map(|r| r.theme_count).max().unwrap_or(0),
+                entries_avg: avg(&|r| r.entries.len() as f64),
+                score_avg: avg(&|r| r.score),
+                weak_avg: avg(&|r| r.weak_words.len() as f64),
+                secs_avg: secs / seeds.len().max(1) as f64,
+            }
+        })
+        .collect()
+}
+
+/// Table of [`theme_density`] rows.
+pub fn format_theme_table(rows: &[ThemeRow]) -> String {
+    let mut s = format!(
+        "{:<8} {:>6} {:>10} {:>9} {:>7} {:>7} {:>7} {:>8}\n",
+        "formato", "ok", "tema medio", "min-max", "parole", "media", "deboli", "s/run"
+    );
+    for r in rows {
+        s.push_str(&format!(
+            "{:<8} {:>6} {:>10.1} {:>9} {:>7.1} {:>7.1} {:>7.1} {:>8.1}\n",
+            r.format,
+            format!("{}/{}", r.ok, r.runs),
+            r.theme_avg,
+            format!("{}-{}", r.theme_min, r.theme_max),
+            r.entries_avg,
+            r.score_avg,
+            r.weak_avg,
+            r.secs_avg
+        ));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +498,41 @@ mod tests {
         assert_eq!(s[0].mean_score, None);
         assert!(format_table(&s).contains('-'));
         assert_eq!(summarize(&[]).last().unwrap().mean_nodes, 0.0);
+    }
+
+    #[test]
+    fn theme_density_counts_theme_words_per_format() {
+        let mut csv = String::new();
+        let alpha = ['A', 'E', 'I', 'O', 'R', 'S'];
+        let mut words: Vec<String> = alpha.iter().map(|c| c.to_string()).collect();
+        for _ in 2..=5 {
+            words = words
+                .iter()
+                .flat_map(|w| alpha.iter().map(move |c| format!("{w}{c}")))
+                .collect();
+            for w in &words {
+                csv.push_str(&format!("{w},voce\n"));
+            }
+        }
+        let dict = crate::api::Dictionary::from_csv_bytes(csv.as_bytes()).unwrap();
+        let base = crate::api::GenerateRequest {
+            theme_words: vec!["ARIA".into(), "SERA".into(), "ORSO".into(), "OSSA".into()],
+            candidates: 4,
+            node_budget: 2_000,
+            blocks: Some(6),
+            ..Default::default()
+        };
+        let rows = theme_density(&dict, &base, &[(5, 5), (5, 7)], &[1, 2]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].format, "5x5");
+        assert_eq!(rows[1].format, "5x7");
+        for r in &rows {
+            assert_eq!(r.runs, 2);
+            assert_eq!(r.ok, 2, "{r:?}");
+            assert!(r.theme_avg >= 1.0 && r.theme_min >= 1 && r.theme_max <= 4);
+            assert!(r.entries_avg > 0.0 && r.score_avg > 0.0);
+        }
+        let t = format_theme_table(&rows);
+        assert!(t.contains("5x7") && t.contains("tema"), "{t}");
     }
 }

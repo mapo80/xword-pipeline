@@ -876,3 +876,60 @@ fn library_llm_clue_options() {
     );
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn bench_measures_theme_density() {
+    let d = TempDir::new("bench-theme");
+    let dict = write_dict(&d, 5);
+    let theme = d.path("tema.txt");
+    std::fs::write(&theme, "# tema\nabba\ncece\nbaco\nzzzz\n").unwrap();
+    let out = run(
+        BENCH,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--theme",
+            s(&theme),
+            "--formats",
+            "5x5,5x6",
+            "--runs",
+            "2",
+            "--request",
+            r#"{"blocks": 6, "candidates": 4, "node_budget": 2000}"#,
+        ],
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("theme: 4 words"), "{stderr}");
+    assert!(stdout.contains("tema medio"), "{stdout}");
+    assert!(stdout.contains("5x6") && stdout.contains("2/2"), "{stdout}");
+    let bad = run(
+        BENCH,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--theme",
+            s(&theme),
+            "--formats",
+            "5by5",
+        ],
+    );
+    assert_eq!(bad.status.code(), Some(2));
+    let bad = run(
+        BENCH,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--theme",
+            s(&theme),
+            "--request",
+            "{",
+        ],
+    );
+    assert_eq!(bad.status.code(), Some(2));
+    let bad = run(BENCH, &["--wordlist", s(&dict), "--theme", "/nope.txt"]);
+    assert_eq!(bad.status.code(), Some(1));
+}

@@ -1,0 +1,16 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <!-- Native engine built by cargo (fill-engine/target/<profile>) -->
+    <XfillCargoTarget Condition="'$(XfillCargoTarget)' == ''">$(MSBuildThisFileDirectory)../target/release</XfillCargoTarget>
+    <XfillNativeName Condition="'$(XfillNativeName)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">xfill.dll</XfillNativeName>
+    <XfillNativeName Condition="'$(XfillNativeName)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">libxfill.dylib</XfillNativeName>
+    <XfillNativeName Condition="'$(XfillNativeName)' == ''">libxfill.so</XfillNativeName>
+  </PropertyGroup>
+</Project>

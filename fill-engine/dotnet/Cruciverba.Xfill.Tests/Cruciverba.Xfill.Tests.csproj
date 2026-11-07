@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- test names read as sentences -->
+    <NoWarn>$(NoWarn);CA1707</NoWarn>
+    <!-- coverage: dotnet test with the coverlet options in dotnet/README.md -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="Shouldly" />
+    <PackageReference Include="coverlet.MTP" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Cruciverba.Xfill/Cruciverba.Xfill.csproj" />
+  </ItemGroup>
+
+  <!-- the native library just built by cargo -->
+  <ItemGroup>
+    <None Include="$(XfillCargoTarget)/$(XfillNativeName)" CopyToOutputDirectory="PreserveNewest" Link="$(XfillNativeName)" />
+  </ItemGroup>
+
+</Project>

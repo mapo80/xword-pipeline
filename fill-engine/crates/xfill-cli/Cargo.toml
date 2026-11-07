@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 xfill-core = { path = "../xfill-core" }
+serde_json = "=1.0.154"

@@ -242,6 +242,7 @@ fn main() {
             ..base_cfg.clone()
         },
         candidates,
+        gen_tries: 50,
         min_mean: keep_mean,
         max_weak,
         stop_after: top * 2,

@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RootNamespace>Cruciverba.Xfill</RootNamespace>
+
+    <!-- NuGet package: version from the tag (xfill-v1.2.3 → -p:Version=1.2.3) -->
+    <PackageId>Cruciverba.Xfill</PackageId>
+    <Version Condition="'$(Version)' == ''">0.1.0</Version>
+    <Authors>mapo80</Authors>
+    <Description>.NET SDK of the xfill crossword engine: generation, validation, cancellation, OpenTelemetry. Native engine for win-x64, win-arm64, linux-x64, linux-arm64, osx-x64, osx-arm64.</Description>
+    <PackageTags>crossword;cruciverba;generator</PackageTags>
+    <RepositoryUrl>https://github.com/mapo80/xword-pipeline</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <!-- Native libraries collected under dotnet/runtimes/<rid>/native/ before packing -->
+    <XfillRuntimesDir Condition="'$(XfillRuntimesDir)' == ''">$(MSBuildThisFileDirectory)../runtimes</XfillRuntimesDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Cruciverba.Xfill.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="$(XfillRuntimesDir)/**/*" Pack="true" PackagePath="runtimes/" Visible="false" />
+  </ItemGroup>
+
+</Project>

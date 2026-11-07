@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Cruciverba.Xfill.Tests/Cruciverba.Xfill.Tests.csproj" />
+  <Project Path="Cruciverba.Xfill/Cruciverba.Xfill.csproj" />
+</Solution>

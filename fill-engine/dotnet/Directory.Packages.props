@@ -1,0 +1,8 @@
+<Project>
+  <!-- Versions verified on api.nuget.org (latest stable). -->
+  <ItemGroup>
+    <PackageVersion Include="xunit.v3" Version="4.0.2" />
+    <PackageVersion Include="Shouldly" Version="4.3.0" />
+    <PackageVersion Include="coverlet.MTP" Version="10.1.0" />
+  </ItemGroup>
+</Project>
