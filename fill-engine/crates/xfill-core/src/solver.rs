@@ -281,6 +281,9 @@ pub struct SolveConfig {
     /// same puzzle, seed and budget give the same result (`time_limit_s`
     /// stays a safety ceiling).
     pub node_limit: u64,
+    /// Theme mode: fill first the entries that can still take a theme word
+    /// (the most constrained of them), then the others.
+    pub theme_slots: bool,
     /// Weight of a theme word when comparing fills: the best fill maximizes
     /// mean + weight × theme words, the clean track maximizes weight × theme
     /// words − weak entries (then mean). 0 = theme words don't count.
@@ -343,6 +346,7 @@ pub const SOLVER_FLAGS: &[&str] = &[
     "--pangram-alphabet",
     "--node-limit",
     "--theme-weight",
+    "--theme-slots",
 ];
 
 impl SolveConfig {
@@ -433,6 +437,14 @@ impl SolveConfig {
                         .map_err(|_| format!("bad --node-limit '{v}' (use a number, 0 = off)"))?;
                     i += 1;
                 }
+                "--theme-slots" => {
+                    self.theme_slots = match value()? {
+                        "on" => true,
+                        "off" => false,
+                        v => return Err(format!("bad --theme-slots '{v}' (use on or off)")),
+                    };
+                    i += 1;
+                }
                 "--theme-weight" => {
                     let v = value()?;
                     self.theme_weight = v
@@ -518,6 +530,7 @@ impl SolveConfig {
             } else {
                 String::new()
             }
+            + if self.theme_slots { ", theme-slots on" } else { "" }
             + &if self.theme_weight > 0.0 {
                 format!(", theme-weight {}", self.theme_weight)
             } else {
@@ -708,6 +721,7 @@ impl Default for SolveConfig {
             time_limit_s: 30.0,
             node_limit: 0,
             theme_weight: 0.0,
+            theme_slots: false,
             // Clue-count scores: 1 clue → 50, 2 → 58, 3 → 63. Secure any fill
             // first, then hunt fills of better-known words.
             tiers: vec![50, 58, 63],
@@ -819,8 +833,10 @@ pub struct Solver<'a> {
     deadline: Instant,
     /// node budget: the attempt stops when `work_base + nodes` reaches it
     node_deadline: u64,
-    /// nodes spent by the earlier attempts of this solve
+    /// work (nodes + candidate trials) of the earlier attempts of this solve
     work_base: u64,
+    /// candidates tried (assigned and propagated) in this attempt
+    trials: u64,
     /// locked answers that are theme words
     locked_theme: usize,
     floor: u8,
@@ -839,6 +855,11 @@ pub struct Solver<'a> {
     pangram: u8,
     pangram_mask: u32,
     theme: std::sync::Arc<std::collections::HashSet<(usize, usize)>>,
+    /// per length: the theme words (empty when there is no theme)
+    theme_mask: Vec<Bitset>,
+    /// theme mode: fill first the entries that can still take a theme
+    /// word
+    theme_slots: bool,
     /// learned nogoods: (entry, word, floor at which it was proven)
     learned: Vec<(usize, usize, u8)>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -978,6 +999,7 @@ impl<'a> Solver<'a> {
             deadline: Instant::now(),
             node_deadline: u64::MAX,
             work_base: 0,
+            trials: 0,
             locked_theme: 0,
             floor: 0,
             cand_cap: defaults.cand_cap,
@@ -994,6 +1016,8 @@ impl<'a> Solver<'a> {
             pangram: 0,
             pangram_mask: 0,
             theme: defaults.theme.clone(),
+            theme_mask: Vec::new(),
+            theme_slots: defaults.theme_slots,
             learned: Vec::new(),
             cancel: None,
             grams: std::collections::HashMap::new(),
@@ -1012,6 +1036,41 @@ impl<'a> Solver<'a> {
         };
         s.compute_base();
         Ok(s)
+    }
+
+    /// Build the per-length theme masks from `self.theme`.
+    fn prepare_theme(&mut self) {
+        self.theme_mask = if self.theme.is_empty() {
+            Vec::new()
+        } else {
+            let mut masks: Vec<Bitset> = self
+                .wl
+                .by_len
+                .iter()
+                .map(|l| Bitset::zeros(l.n.max(1)))
+                .collect();
+            for &(len, w) in self.theme.iter() {
+                if len < masks.len() && w < self.wl.by_len[len].n {
+                    masks[len].set(w);
+                }
+            }
+            masks
+        };
+    }
+
+    /// Theme mode with theme words to place.
+    fn theme_on(&self) -> bool {
+        self.optimize == Optimize::Theme && !self.theme_mask.is_empty()
+    }
+
+    /// Theme words still in the domain of `ei` (in tier).
+    fn theme_candidates(&self, ei: usize) -> impl Iterator<Item = usize> + '_ {
+        let len = self.p.entries[ei].len;
+        let cutoff = self.cutoff_by_entry[ei];
+        self.theme_mask[len]
+            .iter_ones()
+            .take_while(move |&w| w < cutoff)
+            .filter(move |&w| self.domains[ei].get(w))
     }
 
     /// Letter counts (bit-indexed by letter) over the filled cells.
@@ -1299,6 +1358,8 @@ impl<'a> Solver<'a> {
         self.learn = cfg.learn;
         self.optimize = cfg.optimize;
         self.theme = cfg.theme.clone();
+        self.theme_slots = cfg.theme_slots;
+        self.prepare_theme();
         self.pangram = cfg.pangram;
         self.pangram_mask = cfg
             .pangram_alphabet
@@ -1332,6 +1393,8 @@ impl<'a> Solver<'a> {
         let mut best: Option<SolvedFill> = None;
         let mut clean: Option<SolvedFill> = None;
         let mut total_nodes = 0u64;
+        // nodes + candidate trials: what a node budget counts
+        let mut total_work = 0u64;
         let mut restarts = 0u64;
 
         // Tiers are quality floors. We work feasibility-first: the LOWEST floor
@@ -1387,9 +1450,10 @@ impl<'a> Solver<'a> {
         if cfg.exhaustive {
             restarts += 1;
             let seed = self.rng.next_u64();
-            self.work_base = total_nodes;
+            self.work_base = total_work;
             let outcome = self.attempt(lowest, u64::MAX, seed, global_deadline);
             total_nodes += self.nodes;
+            total_work += self.nodes + self.trials;
             match outcome {
                 Outcome::Solved => self.consider(&mut best, &mut clean, cfg),
                 Outcome::Exhausted => proven = true,
@@ -1401,15 +1465,16 @@ impl<'a> Solver<'a> {
         let mut budget = cfg.initial_budget;
         while !proven
             && Instant::now() < global_deadline
-            && total_nodes < node_cap
+            && total_work < node_cap
             && best.is_none()
             && !self.cancelled()
         {
             restarts += 1;
             let seed = self.rng.next_u64();
-            self.work_base = total_nodes;
+            self.work_base = total_work;
             let outcome = self.attempt(lowest, budget, seed, global_deadline);
             total_nodes += self.nodes;
+            total_work += self.nodes + self.trials;
             if outcome == Outcome::Solved {
                 self.consider(&mut best, &mut clean, cfg);
             }
@@ -1436,7 +1501,7 @@ impl<'a> Solver<'a> {
                 .filter(|&f| cfg.clean_floor > 0 && f >= cfg.clean_floor && f > lowest)
                 .collect();
             let hunt_start = Instant::now();
-            let hunt_work = total_nodes;
+            let hunt_work = total_work;
             if !hunt_floors.is_empty()
                 && hunt_start < global_deadline
                 && hunt_work < node_cap
@@ -1453,15 +1518,16 @@ impl<'a> Solver<'a> {
                     };
                     budget = cfg.initial_budget;
                     while Instant::now() < tier_deadline
-                        && total_nodes < tier_nodes
+                        && total_work < tier_nodes
                         && !self.cancelled()
                     {
                         restarts += 1;
                         let seed = self.rng.next_u64();
-                        self.work_base = total_nodes;
+                        self.work_base = total_work;
                         self.node_deadline = tier_nodes;
                         let outcome = self.attempt(floor, budget, seed, tier_deadline);
                         total_nodes += self.nodes;
+                        total_work += self.nodes + self.trials;
                         if outcome == Outcome::Solved {
                             self.consider(&mut best, &mut clean, cfg);
                             break 'hunt;
@@ -1484,14 +1550,15 @@ impl<'a> Solver<'a> {
             let mut idx = 0usize;
             budget = cfg.initial_budget;
             self.node_deadline = node_cap;
-            while Instant::now() < global_deadline && total_nodes < node_cap && !self.cancelled() {
+            while Instant::now() < global_deadline && total_work < node_cap && !self.cancelled() {
                 let floor = polish_floors[idx % polish_floors.len()];
                 idx += 1;
                 restarts += 1;
                 let seed = self.rng.next_u64();
-                self.work_base = total_nodes;
+                self.work_base = total_work;
                 let outcome = self.attempt(floor, budget, seed, global_deadline);
                 total_nodes += self.nodes;
+                total_work += self.nodes + self.trials;
                 if outcome == Outcome::Solved {
                     self.consider(&mut best, &mut clean, cfg);
                 }
@@ -1853,6 +1920,7 @@ impl<'a> Solver<'a> {
             cancel: cfg.cancel.clone(),
             node_limit,
             theme_weight: cfg.theme_weight,
+            theme_slots: cfg.theme_slots,
         });
         let letters = r.letters?;
         let inner_fill = r.fill?;
@@ -2012,6 +2080,7 @@ impl<'a> Solver<'a> {
         self.attempt_budget = budget;
         self.deadline = deadline;
         self.nodes = 0;
+        self.trials = 0;
         self.rng = Rng::new(seed);
 
         self.reset(floor);
@@ -2100,7 +2169,7 @@ impl<'a> Solver<'a> {
         if self.nodes >= self.attempt_budget {
             return Outcome::Budget;
         }
-        if self.work_base + self.nodes >= self.node_deadline {
+        if self.work_base + self.nodes + self.trials >= self.node_deadline {
             return Outcome::TimeLimit;
         }
         if self.nodes & 15 == 0 && (Instant::now() >= self.deadline || self.cancelled()) {
@@ -2122,6 +2191,16 @@ impl<'a> Solver<'a> {
             conf.or_assign(&self.gram_conflict);
 
             for w in candidates {
+                // a candidate that fails propagation costs work too: count
+                // it, and look at the clock, so a node with thousands of
+                // dead candidates stays within the budget
+                self.trials += 1;
+                if self.work_base + self.nodes + self.trials >= self.node_deadline
+                    || (self.trials & 15 == 0
+                        && (Instant::now() >= self.deadline || self.cancelled()))
+                {
+                    return Outcome::TimeLimit;
+                }
                 let mut frame = self.assign(ei, w);
                 let alive = !self.frame_dead(&frame)
                     && (self.propagation == Propagation::Forward || self.propagate(&mut frame))
@@ -2204,6 +2283,22 @@ impl<'a> Solver<'a> {
                     }
                 }
                 frontier = next;
+            }
+        }
+        if self.theme_slots && self.theme_on() {
+            // among the entries that can still take a theme word, the one
+            // with fewest candidates (ties: longer); benchmark: 13x13 19.0
+            // theme words against 10.7 with "longest first"
+            let pick = (0..n)
+                .filter(|&ei| open(ei) && self.theme_candidates(ei).next().is_some())
+                .min_by_key(|&ei| {
+                    (
+                        self.dom_count[ei],
+                        std::cmp::Reverse(self.p.entries[ei].len),
+                    )
+                });
+            if pick.is_some() {
+                return pick;
             }
         }
         let only_linked =
@@ -2305,16 +2400,34 @@ impl<'a> Solver<'a> {
         {
             let ld = self.wl.len_data(len);
             let used = &self.used[len];
-            for w in self.domains[ei].iter_ones() {
-                if w < from {
-                    continue;
-                }
-                if w >= cutoff {
-                    break;
-                }
-                if cands.len() >= batch {
-                    next = Some(w);
-                    break;
+            // theme mode: the entry's theme words all come in the first
+            // batch, whatever their position, and never in a later one
+            let theme_on = self.theme_on();
+            let theme_first: Vec<usize> = if theme_on && from == 0 {
+                self.theme_candidates(ei).collect()
+            } else {
+                Vec::new()
+            };
+            let n_theme = theme_first.len();
+            let words = theme_first
+                .into_iter()
+                .map(|w| (true, w))
+                .chain(self.domains[ei].iter_ones().map(|w| (false, w)));
+            for (is_theme, w) in words {
+                if !is_theme {
+                    if w < from {
+                        continue;
+                    }
+                    if w >= cutoff {
+                        break;
+                    }
+                    if theme_on && self.theme_mask[len].get(w) {
+                        continue;
+                    }
+                    if cands.len() >= batch + n_theme {
+                        next = Some(w);
+                        break;
+                    }
                 }
                 if used.get(w) {
                     continue;
@@ -4808,9 +4921,131 @@ DOG;40
         assert_eq!((cfg.node_limit, cfg.theme_weight), (5000, 1.5));
         assert!(cfg.describe().contains("node-limit 5000"));
         assert!(cfg.describe().contains("theme-weight 1.5"));
+        let on: Vec<String> = vec!["--theme-slots".into(), "on".into()];
+        let cfg = SolveConfig::default().with_args(&on).unwrap();
+        assert!(cfg.theme_slots && cfg.describe().contains("theme-slots on"));
+        let bad: Vec<String> = vec!["--theme-slots".into(), "x".into()];
+        assert!(SolveConfig::default().with_args(&bad).is_err());
         for bad in [["--node-limit", "x"], ["--theme-weight", "-1"]] {
             let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
             assert!(SolveConfig::default().with_args(&args).is_err());
         }
+    }
+
+    // ---- fase 3: densità del tema ----
+
+    /// Theme mode puts the theme words of an entry in its first batch, even
+    /// when they sit far beyond the batch window (low score).
+    #[test]
+    fn theme_words_join_the_first_batch() {
+        let p = Puzzle::from_template("...\n");
+        let mut src = String::new();
+        for a in b'A'..=b'H' {
+            for b in b'A'..=b'H' {
+                src.push_str(&format!("{}{}A;{}\n", a as char, b as char, 90));
+            }
+        }
+        src.push_str("ZZZ;50\n");
+        let wl = Wordlist::from_str(&src, 0);
+        let zzz = wl.len_data(3).index_of(&[25, 25, 25]).unwrap();
+        assert!(zzz > 20, "the theme word is past the first batch");
+        let mut s = Solver::new(&p, &wl);
+        s.optimize = Optimize::Theme;
+        s.cand_cap = 5;
+        s.theme = std::sync::Arc::new([(3usize, zzz)].into_iter().collect());
+        s.prepare_theme();
+        s.reset(0);
+        let (first, next) = s.ordered_candidates_from(0, 0);
+        assert_eq!(first[0], zzz);
+        // and it isn't offered again in a later batch
+        let mut from = next;
+        while let Some(f) = from {
+            let (batch, n) = s.ordered_candidates_from(0, f);
+            assert!(!batch.contains(&zzz));
+            from = n;
+        }
+    }
+
+    /// With theme slots on, the next entry is one that can still take a
+    /// theme word, even when another has fewer candidates.
+    #[test]
+    fn theme_slots_go_first() {
+        // row 0: a 5-letter across entry; column 1: a 2-letter down entry
+        let p = Puzzle::from_template(".....\n#.###\n");
+        let mut src = String::from("AB;60\nCD;60\n");
+        for w in ["CARTA", "CORDA", "MARTE", "PORTA", "SALSA", "ROMAN"] {
+            src.push_str(&format!("{w};70\n"));
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        let roma = wl.len_data(5).index_of(&[17, 14, 12, 0, 13]).unwrap();
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let down = p.find_entry(0, 1, Dir::Down).unwrap();
+        let mut s = Solver::new(&p, &wl);
+        s.optimize = Optimize::Theme;
+        s.theme = std::sync::Arc::new([(5usize, roma)].into_iter().collect());
+        s.prepare_theme();
+        s.reset(0);
+        assert_eq!(s.select_entry(), Some(down), "MRV: 2 candidates < 6");
+        s.theme_slots = true;
+        assert_eq!(s.select_entry(), Some(across));
+    }
+
+    /// Candidates that die at once still spend the node budget: a node with
+    /// thousands of dead candidates can't run past it.
+    #[test]
+    fn dead_candidates_spend_the_node_budget() {
+        // across words over A..J, down words over K..P: every across word
+        // kills the downs it crosses (forward checking)
+        let p = Puzzle::from_template("...\n...\n");
+        let mut src = String::new();
+        for a in b'A'..=b'J' {
+            for b in b'A'..=b'J' {
+                for c in b'A'..=b'J' {
+                    src.push_str(&format!("{}{}{};60\n", a as char, b as char, c as char));
+                }
+            }
+        }
+        for a in b'K'..=b'P' {
+            for b in b'K'..=b'P' {
+                src.push_str(&format!("{}{};60\n", a as char, b as char));
+            }
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        let mut s = Solver::new(&p, &wl);
+        s.propagation = Propagation::Forward;
+        s.optimize = Optimize::Theme;
+        s.theme = std::sync::Arc::new([(3usize, 0usize)].into_iter().collect());
+        s.prepare_theme();
+        s.theme_slots = true; // start from an across entry: 1000 dead words
+        s.node_deadline = 100;
+        let far = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(s.attempt(0, u64::MAX, 1, far), Outcome::TimeLimit);
+        assert!(s.nodes + s.trials <= 100);
+    }
+
+    /// Among the entries that can take a theme word, theme slots pick the
+    /// one with fewest candidates (most constrained), not the longest.
+    #[test]
+    fn theme_slots_pick_the_most_constrained_theme_entry() {
+        // row 0: a 5-letter across entry (many words); column 0: a 2-letter
+        // down entry (two words); both can take a theme word
+        let p = Puzzle::from_template(".....\n.####\n");
+        let mut src = String::from("CA;60\nRO;60\n");
+        for w in [
+            "CARTA", "CORDA", "MARTE", "PORTA", "SALSA", "ROMAN", "RANTO",
+        ] {
+            src.push_str(&format!("{w};70\n"));
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        let roman = wl.len_data(5).index_of(&[17, 14, 12, 0, 13]).unwrap();
+        let ro = wl.len_data(2).index_of(&[17, 14]).unwrap();
+        let down = p.find_entry(0, 0, Dir::Down).unwrap();
+        let mut s = Solver::new(&p, &wl);
+        s.optimize = Optimize::Theme;
+        s.theme = std::sync::Arc::new([(5usize, roman), (2usize, ro)].into_iter().collect());
+        s.prepare_theme();
+        s.theme_slots = true;
+        s.reset(0);
+        assert_eq!(s.select_entry(), Some(down));
     }
 }

@@ -110,13 +110,16 @@ Il motore diventa una libreria usata da altri programmi: un'API in
 
 | # | Aspetto | Tipo | Default | Stato |
 |---|---|---|---|---|
-| 27 | Budget di lavoro in nodi per tutto il `solve` (fasi, caccia al pulito e riparazione divise in nodi invece che in secondi): stesso schema + seme + budget ⇒ stesso risultato su qualunque macchina | `node_limit` (`--node-limit N`) | **0** nei comandi (tempo); **5.000** nell'API | ☑ |
-| 28 | Peso del tema nel confronto tra riempimenti (migliore = media + p × parole a tema; traccia pulita = p × tema − deboli, poi media) e nella scelta tra schemi | `theme_weight` (`--theme-weight W`) | 0 nei comandi; vedi punto 31 nell'API | ☑ |
+| 27 | Budget di lavoro (nodi + candidati provati) per tutto il `solve` (fasi, caccia al pulito e riparazione divise in lavoro invece che in secondi): stesso schema + seme + budget ⇒ stesso risultato su qualunque macchina | `node_limit` (`--node-limit N`) | **0** nei comandi (tempo); **20.000** nell'API | ☑ |
+| 28 | Peso del tema nel confronto tra riempimenti (migliore = media + p × parole a tema; traccia pulita = p × tema − deboli, poi media) e nella scelta tra schemi | `theme_weight` (`--theme-weight W`) | 0 nei comandi; **2** nell'API | ☑ |
 | 29 | Modulo `api`: `generate(&Dictionary, &GenerateRequest, &CancelFlag) -> GenerateResult` (schemi, riempimento parallelo deterministico, scelta, numerazione, definizioni), `validate`, richiesta e risultato serde (contratto JSON della FFI); il binario `library` lo usa | API | sempre attivo | ☑ |
 | 30 | Interfaccia C `xfill-ffi` (cdylib `xfill`), header cbindgen, nessun panic oltre il confine | API | — | ☑ |
-| 31 | Densità del tema: misura nel benchmark, ordine dei candidati, schemi costruiti intorno alle parole a tema | vedi registro | dal benchmark | ☐ |
-| 32 | SDK .NET `Cruciverba.Xfill` (LibraryImport, SafeHandle, async + cancellazione, OpenTelemetry) e pacchetto NuGet per 6 RID | SDK | — | ☐ |
-| 33 | Workflow `nuget.yml` (matrice 6 RID, test .NET su Windows/Linux/macOS, pubblicazione al tag `xfill-v*`) e soglie di copertura in CI | CI | — | ☐ |
+| 31 | Densità del tema: misura nel benchmark (`bench --theme`) | infrastruttura | — | ☑ |
+| 31a | Con `theme`: tutte le parole a tema ammesse da uno slot nel suo primo lotto di candidati, qualunque sia la loro posizione (prima solo se cadevano nella finestra del lotto) | sempre attivo con `theme` | — | ☑ |
+| 31b | Slot a tema per primi: si riempie prima, tra gli slot che possono ancora ospitare una parola a tema, quello con meno candidati | `theme_slots` (`--theme-slots on\|off`) | off nei comandi; **on** nell'API con parole a tema | ☑ |
+| 31c | Più griglie a confronto con il tema (pool) e meno schemi candidati generati in anticipo | `pool`, `candidates` | **pool 4** con tema (2 senza), **40** candidati | ☑ |
+| 32 | SDK .NET `Cruciverba.Xfill` (LibraryImport, SafeHandle, async + cancellazione, OpenTelemetry) e pacchetto NuGet per 6 RID | SDK | — | ☑ |
+| 33 | Workflow `nuget.yml` (matrice 6 RID, test .NET su Windows/Linux/macOS, pubblicazione al tag `xfill-v*`) e soglie di copertura in CI | CI | — | ☑ |
 
 **Determinismo con più thread.** Ogni schema ha un seme fisso (dalla
 sequenza del seme della richiesta) e, con un budget in nodi, un risultato che
@@ -126,6 +129,19 @@ ferma quando gli schemi *finiti dall'inizio senza buchi* contengono già
 scartano. L'esito è quindi lo stesso con 1 o N thread. Il limite di tempo per
 schema resta un tetto di sicurezza: se scatta, il determinismo non è più
 garantito.
+
+### Densità del tema: prima e dopo (lista `bench/temi/geografia.txt`, 399 parole, 3 semi, Db.csv)
+
+| Formato (righe × colonne) | PRIMA: tema · parole · media · deboli · s | DOPO (default API): tema · parole · media · deboli · s |
+|---|---|---|
+| 13 × 13 | 6,0 (5–7) · 56 · 72,5 · 0,0 · 12,2 | **19,0** (17–23) · 59 · 69,8 · 4,7 · 7,3 |
+| 15 × 15 | 4,7 (4–6) · 74 · 70,7 · 5,3 · 18,3 | **21,7** (17–27) · 75 · 70,3 · 8,7 · 8,1 |
+| 12 × 18 | 6,7 (4–9) · 71 · 72,1 · 0,0 · 21,1 | **20,3** (16–27) · 71 · 71,6 · 4,7 · 7,7 |
+| 12 × 22 | 6,3 (5–8) · 87 · 69,8 · 11,3 · 15,5 | **20,0** (19–22) · 89 · 68,3 · 17,3 · 12,6 |
+
+Riempimento sempre 3/3. Costo: media −0,4…−2,7 punti e più parole deboli
+(le parole a tema hanno spesso pochi indizi nel dizionario); tempo per
+griglia dimezzato (meno schemi generati in anticipo).
 
 ## Registro
 
@@ -186,3 +202,7 @@ garantito.
 | 2026-11-07 | 31 | Misura: `bench --theme FILE [--formats …] [--runs N] [--request JSON]` (test rossi → verdi: `theme_density` nel core e integrazione del binario). Liste di prova in `bench/temi/` (geografia 399, animali 99, cucina 83 parole, estratte dalle definizioni del dizionario; solo cultura generale). **PRIMA** (lista geografia, 3 semi, default dell'API, peso 0 = comportamento precedente): 13x13 **6,0** parole a tema (5–7) su 56 · 15x15 **4,7** (4–6) su 74 · 12x18 **6,7** (4–9) su 71 · 12x22 **6,3** (5–8) su 87; 12–21 s per griglia. Con peso 1: 8,0 · 7,3 · 7,3 · 7,3. |
 | 2026-11-07 | 29 | Rosso: una richiesta senza schemi possibili (9×9, parole ≤ 4 lettere) non terminava in 30 s (ogni chiamata al generatore = 50 ricerche da 20.000 nodi). Verde (0,9 s): nell'API 5 tentativi per chiamata (`Plan::gen_tries`; `library` resta a 50) e resa dopo 3 chiamate di fila senza schema se non se n'è trovato nessuno (`GIVE_UP_MISSES`). |
 | 2026-11-07 | 32 | SDK .NET (`dotnet/`): .NET SDK 10.0.403 (ultima patch da releases.json, installata in `~/.dotnet`, fissata in `global.json` con `rollForward: latestPatch`), `Directory.Packages.props` (xunit.v3 4.0.2, Shouldly 4.3.0, coverlet.MTP 10.1.0: ultime stabili su api.nuget.org). `LibraryImport` con source generator, `SafeHandle` per il dizionario, `GenerateAsync` su thread dedicato con il token collegato a un int nativo (`Volatile.Write`), DTO con `System.Text.Json` a generazione di sorgente (snake_case), `ActivitySource`/`Meter` `Cruciverba.Xfill` (span `xfill.generate` con formato COLONNE×RIGHE, nere, tentativi, esito, punteggio, parole a tema; metriche durata, esiti, memoria dei dizionari). Test xUnit v3 scritti dopo il binding (non algoritmico): 16 verdi; copertura **98,9% righe** (70,3% rami). Con .NET 10 `dotnet test` usa Microsoft.Testing.Platform (`global.json`), quindi coverlet.MTP al posto di coverlet.msbuild. |
+| 2026-11-07 | 31a | Rosso: con lotti da 5 la parola a tema ZZZ (punteggio basso, oltre il primo lotto) non era il primo candidato. Verde: maschere per lunghezza delle parole a tema, parole a tema ammesse dallo slot tutte nel primo lotto e mai nei successivi. Sempre attivo con `theme`. |
+| 2026-11-07 | 31b | Rosso: con `theme_slots` la scelta doveva cadere su uno slot che può ospitare una parola a tema anche se un altro ha meno candidati. Verde: `SolveConfig::theme_slots` + `--theme-slots on\|off` (opzione: test e codice insieme). Prima regola «il più lungo»: 13x13 9,0 · 15x15 14,3 · 12x18 16,3 · 12x22 15,0 (peso 1). Prova «il più vincolato tra gli slot a tema»: 13x13 **19,0** contro 10,7, 15x15 21,7 contro 19,3 (peso 2, pool 4), più veloce. Rosso `theme_slots_pick_the_most_constrained_theme_entry` → verde con la regola nuova. **Default API: on** con parole a tema (`theme_slots` nella richiesta). |
+| 2026-11-07 | 27 | Rosso emerso col benchmark del tema: una generazione restava in un nodo per oltre 13 minuti (migliaia di candidati che muoiono alla propagazione non contavano come lavoro né guardavano l'orologio). Test rosso `dead_candidates_spend_the_node_budget` (forward checking, 1000 parole che svuotano gli incroci, budget 100): verde contando i candidati provati nel budget e controllando tempo/annullamento ogni 16 candidati; **mutante** (senza il controllo nel ciclo) catturato. Ricalibrato il budget (bench quality, tetto 30 s): 5.000 23/30 · 73,2 · 4,4 (0,4 s) · **20.000 25/30 · 73,4 · 3,5 (1,4 s)** · 50.000 25/30 · 73,6 · 3,5 (2,6 s). **Default API: 20.000.** |
+| 2026-11-07 | 31c | Peso e pool (con 31a+31b, 40 candidati): peso 1 pool 2 → 13,3 · 16,0 · 21,7 · 16,0; peso 2 pool 2 → 14,7 · 19,0 · 22,0 · 16,3; **peso 2 pool 4 → 19,0 · 21,7 · 20,3 · 20,0**; peso 3 pool 4 → 19,3 · 21,7 · 22,3 · 20,0 (più deboli). **Default API: peso 2, pool 4 con tema (2 senza), 40 candidati** (test rosso → verde sui default). Benchmark con `{}`: identico alla riga «peso 2 pool 4». Liste animali e cucina non misurate (priorità alla pubblicazione). |

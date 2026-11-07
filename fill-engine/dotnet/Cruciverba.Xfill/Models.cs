@@ -69,6 +69,8 @@ public sealed record GenerateRequest
     public IReadOnlyList<string>? ThemeWords { get; init; }
     /// <summary>Weight of a theme word against fill quality.</summary>
     public double? ThemeWeight { get; init; }
+    /// <summary>Fill first the entries that can still take a theme word.</summary>
+    public bool? ThemeSlots { get; init; }
     /// <summary>Candidate ordering: none, weak, strong, max, reliability, theme.</summary>
     public string? Optimize { get; init; }
     /// <summary>Longest entry.</summary>

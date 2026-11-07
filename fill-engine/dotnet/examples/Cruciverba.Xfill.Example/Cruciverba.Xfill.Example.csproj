@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <XfillPackageVersion Condition="'$(XfillPackageVersion)' == ''">0.1.0</XfillPackageVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- the packed SDK (dotnet/artifacts), not the project: tests the package as installed -->
+    <PackageReference Include="Cruciverba.Xfill" VersionOverride="$(XfillPackageVersion)" />
+  </ItemGroup>
+
+</Project>

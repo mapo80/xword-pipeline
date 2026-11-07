@@ -1,16 +1,24 @@
 # fill-engine
 
-Motore di riempimento (Rust, nessuna dipendenza esterna) e quattro comandi.
+Motore di riempimento (Rust), usabile come libreria (API Rust, interfaccia C,
+SDK .NET) e da quattro comandi.
 
 ```
 crates/
   xfill-core/   libreria: bitset, wordlist (+ rebus), clues (CSV), grid,
                 gen_it (schemi), solver, insight (sezioni), words (pattern,
                 anagrammi), llm (definizioni), library (selezione + JSON),
-                pdf, bench
+                api (generate/validate, JSON), pdf, bench
   xfill-cli/    binari: xfill, library, bench, parole
+  xfill-ffi/    interfaccia C (libreria xfill: xfill.dll / libxfill.so /
+                libxfill.dylib), header include/xfill.h generato da cbindgen
+dotnet/         SDK .NET Cruciverba.Xfill, test, esempio (vedi dotnet/README.md)
+bench/temi/     liste a tema di prova per `bench --theme`
 docs/           piano degli algoritmi e registro dei lavori
 ```
+
+Dipendenze: `serde`/`serde_json` (contratto JSON dell'API); il resto è
+scritto da zero.
 
 Piano, scelte e risultati dei benchmark: [docs/piano-algoritmi.md](docs/piano-algoritmi.md).
 
@@ -56,6 +64,9 @@ bianchi, reticolo.
 | `--exhaustive` | off | Un solo tentativo senza budget: riempie o dimostra l'impossibilità |
 | `--parallel portfolio\|split` | `portfolio` | Come più thread lavorano sullo stesso schema |
 | `--eco` | off | Thread a bassa priorità |
+| `--node-limit N` | `0` | Budget di lavoro (nodi + candidati provati) invece del solo tempo: risultato riproducibile |
+| `--theme-weight W` | `0` | Peso di una parola a tema nel confronto tra riempimenti |
+| `--theme-slots on\|off` | `off` | Con `theme`: prima gli slot che possono ancora ospitare una parola a tema (il più vincolato tra loro) |
 
 ## `library` — genera schemi e li riempie
 
@@ -87,6 +98,31 @@ con schema, soluzione, parole numerate e definizioni; opzionalmente i PDF.
 | `--llm-config FILE`, `--llm-model M` | `../../.alibaba`, `qwen3.8-flash` | File con URL (riga 1) e chiave (riga 2); modello |
 | `--out PATH`, `--pdf DIR` | `../out/libraries/grid-library.json`, — | JSON e PDF |
 
+## Libreria: `api::generate` e interfaccia C
+
+```rust
+let dict = xfill_core::api::Dictionary::from_csv_bytes(&std::fs::read("Db.csv")?)?;
+let req: GenerateRequest = serde_json::from_str(r#"{"rows": 12, "cols": 22, "theme_words": ["ROMA"]}"#)?;
+let res = xfill_core::api::generate(&dict, &req, &xfill_core::api::cancel_flag());
+```
+
+- `rows` e `cols` sono sempre espliciti (un formato «22 × 12», COLONNE ×
+  RIGHE, è `rows: 12, cols: 22`).
+- Con `node_budget` (default 20.000 unità di lavoro per schema: nodi +
+  candidati provati) il risultato dipende solo da seme e richiesta, con
+  qualunque numero di thread; `time_per_grid_s` resta un tetto di sicurezza.
+- `CancelFlag` (`Arc<AtomicBool>`) ferma la generazione in pochi ms.
+- `validate` controlla numerazione, coordinate, incroci, risposte rispetto
+  alla griglia, parole ripetute, definizioni che contengono la risposta.
+
+L'interfaccia C (`crates/xfill-ffi/include/xfill.h`) espone le stesse
+funzioni con JSON UTF-8 in/out: `xfill_version`, `xfill_wordlist_load_csv`,
+`xfill_wordlist_free`, `xfill_wordlist_stats`, `xfill_generate`,
+`xfill_validate`, `xfill_string_free`. Codici: 0 ok, −1 argomento, −2 JSON,
+−3 richiesta non valida, −4 panic interno, −5 annullata, −6 dizionario vuoto.
+Header: `cbindgen --config cbindgen.toml --output include/xfill.h` (in
+`crates/xfill-ffi`; la CI verifica che sia aggiornato).
+
 ## `xfill` — riempie uno schema dato
 
 ```bash
@@ -117,6 +153,14 @@ già inserita, `[RE]` casella rebus. Altre opzioni: `--first`, `--workers N`
 ```
 
 Suite fissa di 30 schemi italiani; accetta tutte le opzioni del solver.
+
+```bash
+./target/release/bench --theme bench/temi/geografia.txt --runs 3 \
+    --formats 13x13,15x15,12x18,12x22 --request '{"theme_weight": 1}'
+```
+
+Con `--theme` misura la densità del tema: generazioni complete per formato
+e seme, parole a tema per griglia, parole, media, deboli, tempo.
 
 ## Test
 

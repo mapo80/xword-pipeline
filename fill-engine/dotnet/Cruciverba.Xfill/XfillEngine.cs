@@ -212,6 +212,8 @@ public sealed class XfillEngine : IDisposable
     private static long PrivateBytes()
     {
         using var process = Process.GetCurrentProcess();
-        return process.PrivateMemorySize64;
+        // private bytes where the OS reports them (Windows, Linux), else the working set
+        long privateBytes = process.PrivateMemorySize64;
+        return privateBytes > 0 ? privateBytes : process.WorkingSet64;
     }
 }

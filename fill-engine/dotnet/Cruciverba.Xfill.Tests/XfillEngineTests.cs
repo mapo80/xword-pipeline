@@ -143,6 +143,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
         {
             ThemeWords = ["arte", "rete", "sera", "tana", "nero", "oste", "rosa", "zzzz"],
             ThemeWeight = 2,
+            ThemeSlots = true,
         };
         var result = await _engine.GenerateAsync(request, TestContext.Current.CancellationToken);
         result.ThemeRequested.ShouldBe(8);

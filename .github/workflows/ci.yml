@@ -19,7 +19,7 @@ jobs:
       run:
         working-directory: fill-engine
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -43,3 +43,65 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --release
 
+  ffi:
+    name: xfill-ffi (coverage, header)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fill-engine
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fill-engine
+
+      - name: Tools (cargo-llvm-cov, cbindgen)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1,cbindgen@0.29.4
+
+      - name: Coverage of xfill-ffi (>= 90% lines, blocking)
+        run: cargo llvm-cov --release -p xfill-ffi --summary-only --fail-under-lines 90
+
+      - name: C header up to date
+        working-directory: fill-engine/crates/xfill-ffi
+        run: |
+          cbindgen --config cbindgen.toml --output include/xfill.h
+          git diff --exit-code -- include/xfill.h
+
+  dotnet:
+    name: Cruciverba.Xfill (.NET, coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fill-engine
+
+      - name: Native library
+        working-directory: fill-engine
+        run: cargo build --release -p xfill-ffi
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: fill-engine/dotnet/global.json
+
+      - name: dotnet test (coverage >= 90% lines, blocking)
+        working-directory: fill-engine/dotnet
+        run: >
+          dotnet test
+          --coverlet --coverlet-include "[Cruciverba.Xfill]*"
+          --coverlet-output-format cobertura
+          --coverlet-threshold 90 --coverlet-threshold-type line --coverlet-threshold-stat Total

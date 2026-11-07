@@ -99,8 +99,9 @@ pub struct GenerateRequest {
     /// Patterns to generate and try at most.
     pub candidates: usize,
     /// Filled grids to compare before choosing (the search stops early once
-    /// this many pass the quality filters).
-    pub pool: usize,
+    /// this many pass the quality filters); default [`DEFAULT_POOL`], or
+    /// [`DEFAULT_THEME_POOL`] with theme words.
+    pub pool: Option<usize>,
     /// Search nodes per pattern (0 = time only, not reproducible).
     pub node_budget: u64,
     /// Time per pattern in seconds: the budget when `node_budget` is 0,
@@ -112,6 +113,9 @@ pub struct GenerateRequest {
     /// Weight of a theme word against the fill quality (see
     /// [`crate::SolveConfig::theme_weight`]).
     pub theme_weight: f64,
+    /// With theme words: fill first the entries that can still take one
+    /// (default [`DEFAULT_THEME_SLOTS`]).
+    pub theme_slots: Option<bool>,
     /// Candidate ordering: none, weak, strong, max, reliability, theme
     /// (default: theme with theme words, weak without).
     pub optimize: Option<String>,
@@ -154,12 +158,13 @@ impl Default for GenerateRequest {
             generator: GeneratorKind::Search,
             seed: 1,
             threads: 0,
-            candidates: 200,
-            pool: 2,
+            candidates: DEFAULT_CANDIDATES,
+            pool: None,
             node_budget: DEFAULT_NODE_BUDGET,
             time_per_grid_s: DEFAULT_TIME_CEILING_S,
             theme_words: Vec::new(),
             theme_weight: DEFAULT_THEME_WEIGHT,
+            theme_slots: None,
             optimize: None,
             max_len: None,
             allow_adjacent: true,
@@ -178,12 +183,20 @@ impl Default for GenerateRequest {
     }
 }
 
-/// Default search nodes per pattern (see the benchmark in the plan).
-pub const DEFAULT_NODE_BUDGET: u64 = 5_000;
+/// Default patterns to try at most.
+pub const DEFAULT_CANDIDATES: usize = 40;
+/// Default pool without / with theme words (see the benchmark in the plan).
+pub const DEFAULT_POOL: usize = 2;
+pub const DEFAULT_THEME_POOL: usize = 4;
+/// Default work per pattern (nodes + candidates tried; see the benchmark in
+/// the plan).
+pub const DEFAULT_NODE_BUDGET: u64 = 20_000;
 /// Default safety ceiling per pattern, seconds.
 pub const DEFAULT_TIME_CEILING_S: f64 = 20.0;
+/// Theme slots by default when the request has theme words.
+pub const DEFAULT_THEME_SLOTS: bool = true;
 /// Default weight of a theme word.
-pub const DEFAULT_THEME_WEIGHT: f64 = 1.0;
+pub const DEFAULT_THEME_WEIGHT: f64 = 2.0;
 
 /// Entry direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -561,7 +574,7 @@ pub fn plan_for(wl: &Wordlist, req: &GenerateRequest) -> Result<(Plan, usize), S
     if blocks > cells / 2 {
         return Err(format!("too many blocks: {blocks} of {cells} cells"));
     }
-    if req.candidates == 0 || req.pool == 0 {
+    if req.candidates == 0 || req.pool == Some(0) {
         return Err("candidates and pool must be at least 1".into());
     }
     if !(req.time_per_grid_s > 0.0 && req.time_per_grid_s.is_finite()) {
@@ -591,6 +604,7 @@ pub fn plan_for(wl: &Wordlist, req: &GenerateRequest) -> Result<(Plan, usize), S
         None if !theme.is_empty() => Optimize::Theme,
         None => solve.optimize,
     };
+    solve.theme_slots = !theme.is_empty() && req.theme_slots.unwrap_or(DEFAULT_THEME_SLOTS);
     solve.theme = Arc::new(theme);
     solve.theme_weight = req.theme_weight;
     solve.time_limit_s = req.time_per_grid_s;
@@ -633,7 +647,11 @@ pub fn plan_for(wl: &Wordlist, req: &GenerateRequest) -> Result<(Plan, usize), S
             gen_tries: API_GEN_TRIES,
             min_mean: req.min_mean,
             max_weak: req.max_weak.unwrap_or(usize::MAX),
-            stop_after: req.pool,
+            stop_after: req.pool.unwrap_or(if found > 0 {
+                DEFAULT_THEME_POOL
+            } else {
+                DEFAULT_POOL
+            }),
             threads,
             seed: req.seed,
         },
@@ -1037,7 +1055,7 @@ mod tests {
             rows,
             cols,
             candidates: 12,
-            pool: 3,
+            pool: Some(3),
             node_budget: 4_000,
             ..Default::default()
         }
@@ -1174,7 +1192,7 @@ mod tests {
             node_budget: 0,
             time_per_grid_s: 30.0,
             candidates: 50,
-            pool: 50,
+            pool: Some(50),
             threads: 2,
             ..small(9, 9)
         };
@@ -1372,5 +1390,60 @@ mod tests {
         let r = generate(&d, &small(9, 9), &cancel_flag());
         assert_eq!(r.status, Status::NoGrid);
         assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    }
+
+    /// Theme slots follow the request, default on with theme words, never
+    /// without them.
+    #[test]
+    fn theme_slots_in_the_plan() {
+        let d = dict();
+        let themed = GenerateRequest {
+            theme_words: vec!["arte".into()],
+            ..small(5, 5)
+        };
+        let (plan, _) = plan_for(&d.words, &themed).unwrap();
+        assert_eq!(plan.solve.theme_slots, DEFAULT_THEME_SLOTS);
+        let off = GenerateRequest {
+            theme_slots: Some(false),
+            ..themed.clone()
+        };
+        assert!(!plan_for(&d.words, &off).unwrap().0.solve.theme_slots);
+        let on = GenerateRequest {
+            theme_slots: Some(true),
+            ..themed
+        };
+        assert!(plan_for(&d.words, &on).unwrap().0.solve.theme_slots);
+        let plain = GenerateRequest {
+            theme_slots: Some(true),
+            ..small(5, 5)
+        };
+        assert!(!plan_for(&d.words, &plain).unwrap().0.solve.theme_slots);
+        let r: GenerateRequest = serde_json::from_str(r#"{"theme_slots": false}"#).unwrap();
+        assert_eq!(r.theme_slots, Some(false));
+    }
+
+    /// Without an explicit pool, a themed request compares more grids.
+    #[test]
+    fn default_pool_depends_on_the_theme() {
+        let d = dict();
+        let plain = GenerateRequest::default();
+        assert_eq!(
+            plan_for(&d.words, &plain).unwrap().0.stop_after,
+            DEFAULT_POOL
+        );
+        let themed = GenerateRequest {
+            theme_words: vec!["arte".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_for(&d.words, &themed).unwrap().0.stop_after,
+            DEFAULT_THEME_POOL
+        );
+        let explicit = GenerateRequest {
+            pool: Some(7),
+            ..themed
+        };
+        assert_eq!(plan_for(&d.words, &explicit).unwrap().0.stop_after, 7);
+        assert_eq!(plain.candidates, DEFAULT_CANDIDATES);
     }
 }
