@@ -348,7 +348,11 @@ pub struct Patterns {
 /// Generate up to `plan.candidates` distinct patterns whose entry lengths
 /// all exist in `wl` and that aren't provably unfillable. Deterministic for
 /// a given plan.
-pub fn generate_patterns(wl: &Wordlist, plan: &Plan, cancel: &AtomicBool) -> Patterns {
+pub fn generate_patterns(wl: &Wordlist, plan: &Plan, cancel: &CancelFlag) -> Patterns {
+    let gen = ItGenConfig {
+        cancel: Some(cancel.clone()),
+        ..plan.gen.clone()
+    };
     let mut rng = Rng::new(plan.seed);
     let mut jobs: Vec<(String, u64)> = Vec::with_capacity(plan.candidates);
     let mut tries = 0usize;
@@ -366,7 +370,7 @@ pub fn generate_patterns(wl: &Wordlist, plan: &Plan, cancel: &AtomicBool) -> Pat
         }
         tries += 1;
         let jseed = rng.next_u64();
-        let Some(tpl) = generate_it(&plan.gen, &mut rng, 50) else {
+        let Some(tpl) = generate_it(&gen, &mut rng, 50) else {
             continue;
         };
         let p = Puzzle::from_template_with_rebus(&tpl, &wl.rebus);

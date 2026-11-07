@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xfill-core", "crates/xfill-cli"]
+members = ["crates/xfill-core", "crates/xfill-cli", "crates/xfill-ffi"]
 
 [workspace.package]
 edition = "2021"

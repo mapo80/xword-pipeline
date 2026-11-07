@@ -88,6 +88,8 @@ pub struct ItGenConfig {
     /// Start from a lattice of blacks in every (odd row, odd column) cell
     /// (with their symmetric partners).
     pub lattice: bool,
+    /// Cooperative cancellation: when set, generation gives up (None).
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ItGenConfig {
@@ -109,6 +111,7 @@ impl ItGenConfig {
             require_lengths: Vec::new(),
             max_white_rect: None,
             lattice: false,
+            cancel: None,
         }
     }
 }
@@ -578,6 +581,9 @@ impl Search<'_> {
         if self.cfg.search_budget > 0 && self.nodes > self.cfg.search_budget {
             return Err(());
         }
+        if cancelled(self.cfg) {
+            return Ok(None);
+        }
         let blacks = self.cfg.blacks;
         if placed + 1 >= blacks && complete_ok(self.cfg, p) {
             return Ok(Some(p.to_template()));
@@ -626,6 +632,12 @@ impl Search<'_> {
     }
 }
 
+fn cancelled(cfg: &ItGenConfig) -> bool {
+    cfg.cancel
+        .as_ref()
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 fn search_once(cfg: &ItGenConfig, rng: &mut Rng) -> Found {
     let mut s = Search {
         cfg,
@@ -643,9 +655,14 @@ fn search_once(cfg: &ItGenConfig, rng: &mut Rng) -> Found {
 /// without a pattern proves none exists and stops early.
 pub fn generate_it(cfg: &ItGenConfig, rng: &mut Rng, max_tries: usize) -> Option<String> {
     match cfg.mode {
-        GenMode::Random => (0..max_tries).find_map(|_| try_once(cfg, rng)),
+        GenMode::Random => (0..max_tries)
+            .take_while(|_| !cancelled(cfg))
+            .find_map(|_| try_once(cfg, rng)),
         GenMode::Search => {
             for _ in 0..max_tries {
+                if cancelled(cfg) {
+                    return None;
+                }
                 match search_once(cfg, rng) {
                     Ok(found) => return found,
                     Err(()) => continue, // budget: retry with new randomness
@@ -896,6 +913,25 @@ mod tests {
             for col in (1..9).step_by(2) {
                 assert_eq!(g[r][col], '#', "lattice cell r{r}c{col}\n{t}");
             }
+        }
+    }
+
+    /// A raised cancellation flag stops even a hopeless search at once.
+    #[test]
+    fn cancel_flag_stops_generation() {
+        // runs of at most 4 in a 9×9 with 12 blacks: every try exhausts
+        // its budget (well over a second without the flag)
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        for mode in [GenMode::Search, GenMode::Random] {
+            let c = ItGenConfig {
+                max_len: 4,
+                mode,
+                cancel: Some(flag.clone()),
+                ..ItGenConfig::new(9, 9, 12)
+            };
+            let t = std::time::Instant::now();
+            assert!(generate_it(&c, &mut Rng::new(1), 200_000).is_none());
+            assert!(t.elapsed().as_millis() < 50, "{mode:?}: {:?}", t.elapsed());
         }
     }
 }
