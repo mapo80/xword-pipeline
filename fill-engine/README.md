@@ -1,12 +1,14 @@
 # fill-engine
 
-Motore di riempimento (Rust, nessuna dipendenza esterna) e tre comandi.
+Motore di riempimento (Rust, nessuna dipendenza esterna) e quattro comandi.
 
 ```
 crates/
-  xfill-core/   libreria: bitset, wordlist, clues (CSV), grid, gen_it (schemi),
-                solver, library (selezione + JSON), pdf, bench
-  xfill-cli/    binari: xfill, library, bench
+  xfill-core/   libreria: bitset, wordlist (+ rebus), clues (CSV), grid,
+                gen_it (schemi), solver, insight (sezioni), words (pattern,
+                anagrammi), llm (definizioni), library (selezione + JSON),
+                pdf, bench
+  xfill-cli/    binari: xfill, library, bench, parole
 docs/           piano degli algoritmi e registro dei lavori
 ```
 
@@ -16,23 +18,24 @@ Piano, scelte e risultati dei benchmark: [docs/piano-algoritmi.md](docs/piano-al
 
 **Riempimento** (ricerca su vincoli):
 
-- domini a bitset per (lunghezza, posizione, lettera); una parola piazzata esce
+- domini a bitset per (lunghezza, posizione, simbolo); una parola piazzata esce
   dai domini degli altri slot della stessa lunghezza (niente doppioni);
-- **arco-consistenza** sugli incroci: le lettere ammesse per casella si
-  propagano fino a punto fisso, con cache incrementale (contatori di supporto);
-- **backjumping guidato dai conflitti**: in un vicolo cieco si torna
-  direttamente all'ultima scelta coinvolta;
-- scelta dello slot con meno candidati (MRV); candidati per fascia di punteggio;
-- riavvii con budget crescente; un tentativo esaurito senza tagli dimostra che
-  lo schema è impossibile e chiude la ricerca;
-- soglie di qualità crescenti (prima un riempimento qualsiasi, poi con parole
-  più comuni) e **riparazione locale** delle parole deboli (zona attorno alla
-  parola, prima tutte insieme, poi una alla volta);
-- ricerca parallela (portfolio di semi) in `xfill`.
+- **arco-consistenza** sugli incroci, con cache incrementale delle lettere
+  ammesse (contatori di supporto);
+- **backjumping guidato dai conflitti**; apprendimento opzionale tra i riavvii;
+- scelta dello slot (MRV, per casella vuota, vicinanza alla parte riempita);
+- ordinamento dei candidati per modalità (`weak`, `strong`, `max`,
+  `reliability`, `theme`, `none`), candidati caricati a lotti (mai troncati);
+- riavvii con budget crescente; un tentativo esaurito dimostra che lo schema è
+  impossibile; ricerca esaustiva su richiesta;
+- soglie di qualità crescenti e **riparazione locale** delle parole deboli;
+- N migliori soluzioni con branch and bound;
+- vincoli: niente sottostringhe ripetute, pangramma, rebus;
+- ricerca parallela (portfolio di semi o divisione del primo slot).
 
-**Schemi**: ricerca in profondità sulle orbite di simmetria con memo degli stati
-visitati e potatura esatta (connettività, blocchi 2×2, caselle isolate, limite
-inferiore sulle nere necessarie); completa: trova uno schema se esiste.
+**Schemi**: ricerca in profondità sulle orbite di simmetria, completa (trova
+uno schema se esiste), con vincoli su lunghezze, parole a tutta riga, rettangoli
+bianchi, reticolo.
 
 ### Opzioni del solver (`xfill`, `library`, `bench`)
 
@@ -40,66 +43,80 @@ inferiore sulle nere necessarie); completa: trova uno schema se esiste.
 |---|---|---|
 | `--propagation forward\|arc` | `arc` | Propagazione: solo incroci diretti, o arco-consistenza |
 | `--backjump on\|off` | `on` | Backjumping guidato dai conflitti |
+| `--learn on\|off` | `off` | Parole dimostrate impossibili escluse nei riavvii successivi |
 | `--slot-order mrv\|per-cell` | `mrv` | Meno candidati, o meno candidati per casella vuota |
-| `--linked on\|off` | `off` | Preferisci slot che incrociano la parte già riempita |
+| `--linked off\|near\|on` | `off` | Prossimo slot entro 2 incroci (`near`) o incrociante (`on`) la parte riempita |
+| `--optimize none\|weak\|strong\|max\|reliability\|theme` | `weak` | Ordine dei candidati |
+| `--theme-list FILE` | — | Parole a tema (una per riga) per `--optimize theme` |
 | `--lookahead K` | `0` | Riordina i primi K candidati per opzioni reali lasciate agli incroci |
+| `--max-cands M`, `--cand-ratio P` | `400`, `1` | Lotti di candidati di min(M, max(20, N/P)) |
 | `--avoid-substrings K` | `0` | Vieta sottostringhe di K lettere comuni a due parole |
 | `--repair-max-weak N` | `4` | Riparazione delle parole deboli (0 = spenta) |
+| `--pangram K`, `--pangram-alphabet ABC…` | `0`, 21 lettere italiane | Ogni lettera almeno K volte |
+| `--exhaustive` | off | Un solo tentativo senza budget: riempie o dimostra l'impossibilità |
+| `--parallel portfolio\|split` | `portfolio` | Come più thread lavorano sullo stesso schema |
+| `--eco` | off | Thread a bassa priorità |
 
 ## `library` — genera schemi e li riempie
 
 Genera molti schemi con le caselle nere richieste, scarta quelli impossibili
-per il dizionario, li riempie in parallelo e tiene i migliori (meno parole
-"deboli", poi punteggio medio più alto). Scrive un JSON con schema, soluzione,
-parole numerate e definizioni; opzionalmente i PDF.
+per il dizionario, li riempie in parallelo e tiene i migliori. Scrive un JSON
+con schema, soluzione, parole numerate e definizioni; opzionalmente i PDF.
 
 | Opzione | Default | Descrizione |
 |---|---|---|
 | `--wordlist PATH` | `../../dataset/Db.csv` | CSV `PAROLA,definizione` |
 | `--size RxC` | `13x13` | Righe × colonne (oppure `N` per un quadrato) |
 | `--blocks N` | ~15% delle caselle | Numero di caselle nere (±1 con la simmetria) |
-| `--symmetry` | `rot` | `none`, `rot` (rotazione 180°), `mirror` (speculare sinistra-destra) |
-| `--gen search\|random` | `search` | Generatore di schemi: ricerca completa, o cammino casuale |
-| `--max-len N` | lato maggiore | Lunghezza massima di una parola (mai oltre la più lunga del dizionario) |
+| `--symmetry none\|rot\|mirror` | `rot` | Simmetria delle nere |
+| `--gen search\|random` | `search` | Generatore di schemi |
+| `--max-len N` | lato maggiore | Lunghezza massima di una parola |
 | `--max-two-letter PCT` | — | Al massimo PCT% di parole da 2 lettere |
+| `--min-len-count L:N,…` | — | Almeno N parole di lunghezza L |
+| `--require-lengths L,…` | — | Lunghezze che devono comparire (es. per parole a tema) |
+| `--max-full-words N` | — | Al massimo N parole a tutta riga/colonna |
+| `--max-white-rect A` | — | Nessun rettangolo bianco più grande di A caselle |
+| `--lattice` | off | Reticolo di nere nelle caselle (dispari, dispari) |
 | `--no-adjacent` | off | Vieta caselle nere che si toccano |
-| `--candidates N` | `200` | Schemi da generare e provare |
-| `--time SECS` | `2.0` | Tempo massimo di riempimento per schema |
-| `--keep-mean F` | `0` | Tieni solo riempimenti con punteggio medio ≥ F |
-| `--weak-bar N` / `--max-weak N` | `58` / nessuno | Parole sotto N sono "deboli"; tieni solo riempimenti con ≤ N deboli |
-| `--per-shape N` | `4` | Massimo riempimenti diversi dello stesso schema |
-| `--top N` | `10` | Quanti cruciverba tenere |
-| `--seed N` | `1` | Seme casuale |
-| `--workers N` | n. CPU | Thread di riempimento (uno schema per thread) |
-| `--out PATH` | `../out/libraries/grid-library.json` | File JSON di uscita (parole con definizione) |
-| `--pdf DIR` | — | Un PDF A4 per cruciverba: schema numerato e definizioni su una pagina, soluzione sulla seguente |
+| `--rebus RE,…` | — | Stringhe che il solver può mettere in una sola casella |
+| `--candidates N`, `--time SECS` | `200`, `2.0` | Schemi da provare e tempo per schema |
+| `--keep-mean F`, `--weak-bar N`, `--max-weak N` | `0`, `58`, — | Filtri di qualità |
+| `--per-shape N`, `--top N` | `4`, `10` | Selezione dei migliori |
+| `--seed N`, `--workers N` | `1`, n. CPU | Seme e thread |
+| `--llm-clues off\|missing\|all` | `off` | Definizioni da un LLM per le parole senza (o per tutte) |
+| `--llm-config FILE`, `--llm-model M` | `../../.alibaba`, `qwen3.8-flash` | File con URL (riga 1) e chiave (riga 2); modello |
+| `--out PATH`, `--pdf DIR` | `../out/libraries/grid-library.json`, — | JSON e PDF |
 
 ## `xfill` — riempie uno schema dato
 
 ```bash
 ./target/release/xfill schema.txt --time 10 --boxed
-./target/release/xfill schema.txt --lock "0,0,A,CASA"   # parola imposta
-./target/release/xfill schema.txt --analyze             # cosa è possibile, senza cercare
+./target/release/xfill schema.txt --lock "0,0,A,CASA"     # parola imposta
+./target/release/xfill schema.txt --best 5                # le 5 migliori soluzioni
+./target/release/xfill schema.txt --suggest 0,0,A         # candidati per uno slot
+./target/release/xfill schema.txt --analyze               # sezioni e lettere forzate
 ```
 
-Formato dello schema: una riga per riga della griglia; `#` casella nera, `.`
-casella vuota, `A`–`Z` lettera già inserita. Altre opzioni: `--time`, `--seed`,
-`--first` (primo riempimento, il thread vincente ferma gli altri),
-`--workers N` (default: n. CPU), `--tiers 50,58,63`, `--min-score`.
+Schema: una riga per riga della griglia; `#` nera, `.` vuota, `A`–`Z` lettera
+già inserita, `[RE]` casella rebus. Altre opzioni: `--first`, `--workers N`
+(default automatico), `--seed`, `--tiers`, `--min-score`, `--rebus RE,…`,
+`--suggest-check SECS`, `--theme-list FILE`.
 
-`--analyze` stampa se lo schema è fattibile, gli slot impossibili, le lettere
-forzate dalla propagazione e quante lettere restano possibili per casella.
+## `parole` — strumenti sul dizionario
+
+```bash
+./target/release/parole pattern "?A?A" --clues          # ? * @ (vocale) # (consonante) [..] [^..]
+./target/release/parole anagram ROMANO --words 2         # anche con ? come jolly
+```
 
 ## `bench` — confronto tra varianti
 
 ```bash
-./target/release/bench --time 5 --mode first               # tempo al primo riempimento
-./target/release/bench --time 3 --mode quality --backjump off
+./target/release/bench --time 5 --mode first
+./target/release/bench --time 3 --mode quality --optimize max --threads 8
 ```
 
-Suite fissa di 30 schemi italiani (9×9 … 13×21); riporta per famiglia gli
-schemi riempiti, la mediana dei tempi, i nodi, il punteggio medio e le parole
-deboli. Accetta tutte le opzioni del solver.
+Suite fissa di 30 schemi italiani; accetta tutte le opzioni del solver.
 
 ## Test
 

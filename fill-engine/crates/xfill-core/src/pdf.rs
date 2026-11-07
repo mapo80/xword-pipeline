@@ -179,7 +179,7 @@ impl Page {
 }
 
 fn draw_grid(page: &mut Page, pz: &PdfPuzzle, x0: f64, y0: f64, cell: f64, letters: bool) {
-    let grid: Vec<Vec<char>> = pz.fill.iter().map(|r| r.chars().collect()).collect();
+    let grid: Vec<Vec<String>> = pz.fill.iter().map(|r| crate::grid::row_cells(r)).collect();
     let rows = grid.len();
     let cols = grid.first().map_or(0, |r| r.len());
     let num_at = |r: usize, c: usize| {
@@ -189,10 +189,10 @@ fn draw_grid(page: &mut Page, pz: &PdfPuzzle, x0: f64, y0: f64, cell: f64, lette
             .map(|&(_, _, n)| n)
     };
     for (r, row) in grid.iter().enumerate() {
-        for (c, &ch) in row.iter().enumerate() {
+        for (c, txt) in row.iter().enumerate() {
             let x = x0 + c as f64 * cell;
             let y = y0 + r as f64 * cell;
-            if ch == '#' {
+            if txt == "#" {
                 page.rect_fill(x, y, cell, cell);
                 continue;
             }
@@ -200,14 +200,11 @@ fn draw_grid(page: &mut Page, pz: &PdfPuzzle, x0: f64, y0: f64, cell: f64, lette
             if let Some(n) = num_at(r, c) {
                 page.text(x + 1.5, y + cell * 0.3, cell * 0.27, false, &n.to_string());
             }
-            if letters && ch.is_alphabetic() {
-                page.text_centered(
-                    x + cell / 2.0,
-                    y + cell * 0.8,
-                    cell * 0.55,
-                    true,
-                    &ch.to_string(),
-                );
+            // a letter, or a rebus string (shrunk to fit the square)
+            let shown = txt.trim_start_matches('[').trim_end_matches(']');
+            if letters && shown.chars().all(char::is_alphabetic) && !shown.is_empty() {
+                let size = cell * 0.55 / (shown.chars().count() as f64).sqrt();
+                page.text_centered(x + cell / 2.0, y + cell * 0.8, size, true, shown);
             }
         }
     }
@@ -325,11 +322,19 @@ fn one_page_layout(pz: &PdfPuzzle, rows: usize, cols: usize) -> Option<(f64, Flo
     None
 }
 
+/// Columns of the grid (a rebus `[RE]` is one cell).
+fn grid_cols(pz: &PdfPuzzle) -> usize {
+    pz.fill
+        .first()
+        .map_or(1, |r| crate::grid::row_cells(r).len())
+        .max(1)
+}
+
 /// Render the puzzle to PDF bytes: grid + clues (on one page whenever a
 /// readable layout exists), then a solution page.
 pub fn render_pdf(pz: &PdfPuzzle) -> Vec<u8> {
     let rows = pz.fill.len().max(1);
-    let cols = pz.fill.first().map_or(1, |r| r.chars().count()).max(1);
+    let cols = grid_cols(pz);
     let avail_w = PAGE_W - 2.0 * MARGIN;
 
     let (cell, flow) = one_page_layout(pz, rows, cols).unwrap_or_else(|| {
@@ -515,6 +520,32 @@ mod tests {
             .unwrap();
         assert!(count > 2, "expected overflow pages, got {count}");
         assert!(s.contains("(150.)"), "last clue rendered");
+    }
+
+    #[test]
+    fn rebus_cells_render_as_one_square() {
+        let pz = PdfPuzzle {
+            title: "R".into(),
+            subtitle: String::new(),
+            fill: vec!["C[RE]DO".into(), "#X##".into()],
+            numbers: vec![(0, 0, 1), (0, 1, 2)],
+            across: vec![PdfClue {
+                num: 1,
+                text: "Credo".into(),
+            }],
+            down: vec![PdfClue {
+                num: 2,
+                text: "Re".into(),
+            }],
+        };
+        let pdf = String::from_utf8_lossy(&render_pdf(&pz)).to_string();
+        assert!(
+            pdf.contains("(RE) Tj"),
+            "the rebus string is drawn in its cell"
+        );
+        assert!(!pdf.contains("([) Tj"), "brackets are not cells");
+        // 4 columns: grid width = 4 cells, so no cell is drawn past column 4
+        assert_eq!(grid_cols(&pz), 4);
     }
 
     #[test]

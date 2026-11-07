@@ -1,12 +1,44 @@
 //! Compile a 2D template into a geometry-agnostic `Puzzle`.
 //!
-//! Template chars: `#` block, `.` empty white, `A-Z` pre-placed letter (themers
-//! / rebus seeds). Rows separated by newlines; spaces within a row ignored.
+//! Template cells: `#` block, `.` empty white, `A-Z` pre-placed letter, `[RE]`
+//! a rebus cell holding several letters. Rows separated by newlines; spaces
+//! within a row ignored.
 //!
 //! Following crossword-composer's insight, the solver operates only on the
 //! incidence structure (entries ↔ cells); 2D geometry is kept solely for I/O.
 
-use crate::wordlist::MIN_LEN;
+use crate::wordlist::{MIN_LEN, REBUS_BASE};
+
+/// Split a template row into cells: one char each, or a bracketed rebus
+/// string (`[RE]`) as a single cell.
+pub fn row_cells(row: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = row.chars().filter(|c| !c.is_whitespace());
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            let inner: String = chars.by_ref().take_while(|&d| d != ']').collect();
+            out.push(format!("[{}]", inner.to_ascii_uppercase()));
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// The rebus strings of a template, in order of first appearance.
+pub fn rebus_strings(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        for cell in row_cells(line) {
+            if let Some(inner) = cell.strip_prefix('[').and_then(|c| c.strip_suffix(']')) {
+                if !out.iter().any(|r| r == inner) {
+                    out.push(inner.to_string());
+                }
+            }
+        }
+    }
+    out
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dir {
@@ -32,21 +64,29 @@ pub struct Puzzle {
     /// cell -> Some(letter 0..25) if pre-placed
     pub prefilled: Vec<Option<u8>>,
     pub cell_rc: Vec<(usize, usize)>,
+    /// Rebus strings: symbol `REBUS_BASE + k` stands for `rebus[k]`.
+    pub rebus: Vec<String>,
 }
 
 impl Puzzle {
     pub fn from_template(text: &str) -> Puzzle {
-        let rows_raw: Vec<Vec<char>> = text
+        Self::from_template_with_rebus(text, &rebus_strings(text))
+    }
+
+    /// Like `from_template`, with the rebus symbol table given (it must list
+    /// the template's rebus strings; extra ones may follow, e.g. free rebus
+    /// strings the solver may place anywhere).
+    pub fn from_template_with_rebus(text: &str, rebus: &[String]) -> Puzzle {
+        let rows_raw: Vec<Vec<String>> = text
             .lines()
-            .map(|l| l.trim().replace(' ', ""))
+            .map(row_cells)
             .filter(|l| !l.is_empty())
-            .map(|l| l.chars().collect())
             .collect();
         let rows = rows_raw.len();
         let cols = rows_raw[0].len();
         assert!(rows_raw.iter().all(|r| r.len() == cols), "ragged template");
 
-        let is_block = |r: usize, c: usize| rows_raw[r][c] == '#';
+        let is_block = |r: usize, c: usize| rows_raw[r][c] == "#";
 
         // Assign cell ids to white cells.
         let mut cell_id = vec![vec![usize::MAX; cols]; rows];
@@ -58,8 +98,15 @@ impl Puzzle {
                     let id = cell_rc.len();
                     cell_id[r][c] = id;
                     cell_rc.push((r, c));
-                    let ch = rows_raw[r][c];
-                    prefilled.push(if ch.is_ascii_uppercase() {
+                    let cell = &rows_raw[r][c];
+                    let ch = cell.chars().next().unwrap_or('.');
+                    prefilled.push(if let Some(inner) = cell.strip_prefix('[') {
+                        let inner = inner.trim_end_matches(']');
+                        rebus
+                            .iter()
+                            .position(|x| x == inner)
+                            .map(|k| REBUS_BASE + k as u8)
+                    } else if ch.is_ascii_uppercase() {
                         Some(ch as u8 - b'A')
                     } else {
                         None
@@ -139,6 +186,16 @@ impl Puzzle {
             cell_entries,
             prefilled,
             cell_rc,
+            rebus: rebus.to_vec(),
+        }
+    }
+
+    /// Text of one cell symbol: a letter, or `[RE]` for a rebus.
+    pub(crate) fn symbol_text(&self, b: u8) -> String {
+        if b < REBUS_BASE {
+            ((b'A' + b) as char).to_string()
+        } else {
+            format!("[{}]", self.rebus[(b - REBUS_BASE) as usize])
         }
     }
 
@@ -182,20 +239,16 @@ impl Puzzle {
 
     /// Render with an optional assignment (cell -> letter 0..25).
     pub fn render(&self, letters: Option<&[Option<u8>]>) -> String {
-        let mut out = vec![vec!['#'; self.cols]; self.rows];
+        let mut out = vec![vec!["#".to_string(); self.cols]; self.rows];
         for cid in 0..self.n_cells {
             let (r, c) = self.cell_rc[cid];
-            let ch = match letters.and_then(|l| l[cid]) {
-                Some(b) => (b'A' + b) as char,
-                None => match self.prefilled[cid] {
-                    Some(b) => (b'A' + b) as char,
-                    None => '.',
-                },
+            out[r][c] = match letters.and_then(|l| l[cid]).or(self.prefilled[cid]) {
+                Some(b) => self.symbol_text(b),
+                None => ".".to_string(),
             };
-            out[r][c] = ch;
         }
         out.iter()
-            .map(|row| row.iter().collect::<String>())
+            .map(|row| row.concat())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -206,12 +259,21 @@ impl Puzzle {
         let mut grid = vec![vec!['\0'; self.cols]; self.rows];
         for cid in 0..self.n_cells {
             let (r, c) = self.cell_rc[cid];
-            grid[r][c] = match letters.and_then(|l| l[cid]) {
-                Some(b) => (b'A' + b) as char,
-                None => match self.prefilled[cid] {
-                    Some(b) => (b'A' + b) as char,
-                    None => ' ',
-                },
+            grid[r][c] = match letters.and_then(|l| l[cid]).or(self.prefilled[cid]) {
+                // a rebus cell shows its first letter in lower case
+                Some(b) => self
+                    .symbol_text(b)
+                    .trim_start_matches('[')
+                    .chars()
+                    .next()
+                    .map_or(' ', |ch| {
+                        if b < REBUS_BASE {
+                            ch
+                        } else {
+                            ch.to_ascii_lowercase()
+                        }
+                    }),
+                None => ' ',
             };
         }
         grid
@@ -289,6 +351,19 @@ mod tests {
             0,
             "r1c0 is still covered by its down entry"
         );
+    }
+
+    #[test]
+    fn rebus_cells_in_templates() {
+        assert_eq!(
+            rebus_strings("C[RE]DO\n#[TH]##\n[re]...\n"),
+            vec!["RE", "TH"]
+        );
+        let p = Puzzle::from_template("C[RE]DO\n#.##\n");
+        assert_eq!(p.cols, 4, "a bracketed string is one cell");
+        assert_eq!(p.prefilled[1], Some(crate::wordlist::REBUS_BASE));
+        assert_eq!(p.rebus, vec!["RE".to_string()]);
+        assert_eq!(p.render(None).lines().next().unwrap(), "C[RE]DO");
     }
 
     #[test]

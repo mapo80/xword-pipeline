@@ -81,6 +81,18 @@ impl Bitset {
         false
     }
 
+    /// Lowest index set in both `self` and `other`, if below `limit`.
+    pub fn first_and_below(&self, other: &Bitset, limit: usize) -> Option<usize> {
+        for (i, (a, b)) in self.words.iter().zip(other.words.iter()).enumerate() {
+            let x = a & b;
+            if x != 0 {
+                let idx = i * 64 + x.trailing_zeros() as usize;
+                return (idx < limit).then_some(idx);
+            }
+        }
+        None
+    }
+
     /// Number of bits set in both `self` and `other` below index `limit`.
     pub fn count_and_below(&self, other: &Bitset, limit: usize) -> u32 {
         let full = (limit / 64).min(self.words.len());
@@ -204,6 +216,23 @@ mod tests {
         assert_eq!(a.count_and_below(&b, 150), 2);
         assert_eq!(a.count_and_below(&b, 151), 3);
         assert_eq!(a.count_and_below(&b, 0), 0);
+    }
+
+    #[test]
+    fn first_and_below_finds_lowest_common_bit() {
+        let mut a = Bitset::zeros(200);
+        let mut b = Bitset::zeros(200);
+        a.set(150);
+        b.set(150);
+        a.set(10);
+        assert_eq!(a.first_and_below(&b, 200), Some(150));
+        assert_eq!(a.first_and_below(&b, 150), None);
+        b.set(10);
+        assert_eq!(a.first_and_below(&b, 200), Some(10));
+        assert_eq!(
+            Bitset::zeros(70).first_and_below(&Bitset::ones(70), 70),
+            None
+        );
     }
 
     #[test]

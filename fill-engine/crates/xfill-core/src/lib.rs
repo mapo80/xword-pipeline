@@ -13,11 +13,14 @@ pub mod bitset;
 pub mod clues;
 pub mod gen_it;
 pub mod grid;
+pub mod insight;
 pub mod library;
+pub mod llm;
 pub mod pdf;
 pub mod solver;
 pub mod util;
 pub mod wordlist;
+pub mod words;
 
 pub use grid::Puzzle;
 pub use solver::{solve_portfolio, Analysis, Lock, SolveConfig, SolveResult, Solver};

@@ -75,7 +75,7 @@ fn capitalize_first(s: &str) -> String {
 }
 
 /// Uppercase A–Z letters of `s` (accents folded, everything else dropped).
-fn normalize_letters_lossy(s: &str) -> String {
+pub(crate) fn normalize_letters_lossy(s: &str) -> String {
     s.split(|c: char| !c.is_alphabetic())
         .filter_map(normalize_answer)
         .collect()
@@ -232,6 +232,16 @@ pub fn parse_clue_csv(bytes: &[u8]) -> HashMap<String, Vec<String>> {
 /// counts) and the clue database used to clue the finished grid. A
 /// `blocklist.txt` next to the CSV is honored, as with `Wordlist::load`.
 pub fn load_clue_csv(path: &str, min_score: u8) -> std::io::Result<(Wordlist, ClueDb)> {
+    load_clue_csv_rebus(path, min_score, &[])
+}
+
+/// Like `load_clue_csv`, adding rebus variants for these strings (see
+/// `Wordlist::from_str_rebus`).
+pub fn load_clue_csv_rebus(
+    path: &str,
+    min_score: u8,
+    rebus: &[String],
+) -> std::io::Result<(Wordlist, ClueDb)> {
     let bytes = fs::read(path)?;
     let clues = parse_clue_csv(&bytes);
     let blocklist = blocklist_beside(path);
@@ -247,7 +257,7 @@ pub fn load_clue_csv(path: &str, min_score: u8) -> std::io::Result<(Wordlist, Cl
         dict.push_str(&score_from_clue_count(clues[a].len()).to_string());
         dict.push('\n');
     }
-    let wl = Wordlist::from_str_filtered(&dict, min_score, &blocklist);
+    let wl = Wordlist::from_str_rebus(&dict, min_score, &blocklist, rebus);
     Ok((wl, ClueDb { clues }))
 }
 

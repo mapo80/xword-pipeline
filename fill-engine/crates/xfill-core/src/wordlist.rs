@@ -18,6 +18,10 @@ pub const MAX_LEN: usize = 24;
 /// answers; a 1-letter run is an unclued cell (it belongs only to the
 /// perpendicular entry), which `grid::Puzzle` already models.
 pub const MIN_LEN: usize = 2;
+/// Symbols per cell: 26 letters plus up to 6 rebus strings.
+pub const ALPHA: usize = 32;
+/// Symbol of the first rebus string (letters are 0..26).
+pub const REBUS_BASE: u8 = 26;
 
 /// Letters of `s` as 0..25, ignoring any non-alphabetic characters.
 fn normalize_letters(s: &str) -> Vec<u8> {
@@ -76,12 +80,12 @@ pub struct LenData {
 impl LenData {
     #[inline]
     pub fn compat(&self, pos: usize, c: u8) -> &Bitset {
-        &self.compat[pos * 26 + c as usize]
+        &self.compat[pos * ALPHA + c as usize]
     }
 
     #[inline]
     pub fn pos_count(&self, pos: usize, c: u8) -> u32 {
-        self.pos_count[pos * 26 + c as usize]
+        self.pos_count[pos * ALPHA + c as usize]
     }
 
     /// First word index whose score is < `floor` (cutoff for a quality tier).
@@ -118,6 +122,8 @@ impl LenData {
 pub struct Wordlist {
     /// Indexed by length; entries for len < MIN_LEN are empty placeholders.
     pub by_len: Vec<LenData>,
+    /// Rebus strings: symbol `REBUS_BASE + k` stands for `rebus[k]`.
+    pub rebus: Vec<String>,
 }
 
 impl Wordlist {
@@ -130,6 +136,24 @@ impl Wordlist {
         min_score: u8,
         blocklist: &HashSet<Box<[u8]>>,
     ) -> Wordlist {
+        Self::from_str_rebus(text, min_score, blocklist, &[])
+    }
+
+    /// Like `from_str_filtered`, plus rebus variants: for each rebus string
+    /// R (at most `ALPHA - 26`) every word containing R also enters as a
+    /// variant with that occurrence replaced by R's single-cell symbol (same
+    /// score). `word()` spells variants back with the full string.
+    pub fn from_str_rebus(
+        text: &str,
+        min_score: u8,
+        blocklist: &HashSet<Box<[u8]>>,
+        rebus: &[String],
+    ) -> Wordlist {
+        let rebus: Vec<String> = rebus
+            .iter()
+            .map(|r| r.to_ascii_uppercase())
+            .take(ALPHA - REBUS_BASE as usize)
+            .collect();
         // collect (letters, score) per length
         let mut buckets: Vec<Vec<(Box<[u8]>, u8)>> = (0..=MAX_LEN).map(|_| Vec::new()).collect();
         let mut seen: HashSet<Box<[u8]>> = HashSet::new();
@@ -176,6 +200,36 @@ impl Wordlist {
             buckets[len].push((boxed, score));
         }
 
+        // rebus variants
+        for (k, r) in rebus.iter().enumerate() {
+            let rl = normalize_letters(r);
+            if rl.len() < 2 {
+                continue;
+            }
+            let sym = REBUS_BASE + k as u8;
+            let originals: Vec<(Box<[u8]>, u8)> = buckets.iter().flatten().cloned().collect();
+            for (w, sc) in originals {
+                if w.iter().any(|&c| c >= REBUS_BASE) {
+                    continue;
+                }
+                for i in 0..=w.len().saturating_sub(rl.len()) {
+                    if w.len() < rl.len() || w[i..i + rl.len()] != rl[..] {
+                        continue;
+                    }
+                    let v: Vec<u8> = w[..i]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(sym))
+                        .chain(w[i + rl.len()..].iter().copied())
+                        .collect();
+                    let boxed: Box<[u8]> = v.into_boxed_slice();
+                    if (MIN_LEN..=MAX_LEN).contains(&boxed.len()) && seen.insert(boxed.clone()) {
+                        buckets[boxed.len()].push((boxed, sc));
+                    }
+                }
+            }
+        }
+
         let mut by_len: Vec<LenData> = Vec::with_capacity(MAX_LEN + 1);
         for (len, mut entries) in buckets.into_iter().enumerate() {
             // score desc, tie-break by letters asc for determinism
@@ -188,11 +242,11 @@ impl Wordlist {
                 scores.push(s);
             }
             // build compat masks
-            let n_masks = if len >= MIN_LEN { len * 26 } else { 0 };
+            let n_masks = if len >= MIN_LEN { len * ALPHA } else { 0 };
             let mut compat: Vec<Bitset> = (0..n_masks).map(|_| Bitset::zeros(n.max(1))).collect();
             for (i, w) in letters.iter().enumerate() {
                 for (p, &c) in w.iter().enumerate() {
-                    compat[p * 26 + c as usize].set(i);
+                    compat[p * ALPHA + c as usize].set(i);
                 }
             }
             let pos_count: Vec<u32> = compat.iter().map(|b| b.count_ones()).collect();
@@ -206,7 +260,21 @@ impl Wordlist {
             });
         }
 
-        Wordlist { by_len }
+        Wordlist { by_len, rebus }
+    }
+
+    /// Word `i` of length `len`, with rebus symbols spelled out.
+    pub fn word(&self, len: usize, i: usize) -> String {
+        self.len_data(len).letters[i]
+            .iter()
+            .map(|&c| {
+                if c < REBUS_BASE {
+                    ((b'A' + c) as char).to_string()
+                } else {
+                    self.rebus[(c - REBUS_BASE) as usize].clone()
+                }
+            })
+            .collect()
     }
 
     #[inline]
@@ -318,6 +386,28 @@ FOO;25
         let p = crate::grid::Puzzle::from_template("...\n");
         assert!(wl.missing_lengths(&p).is_empty());
         assert_eq!(Wordlist::from_str("", 0).longest(), 0);
+    }
+
+    #[test]
+    fn rebus_variants_replace_the_string_with_a_symbol() {
+        let wl = Wordlist::from_str_rebus(
+            "CREDO;80\nREDO;70\nCARE;60\nSOLE;50\n",
+            0,
+            &HashSet::new(),
+            &["RE".to_string()],
+        );
+        assert_eq!(wl.rebus, vec!["RE".to_string()]);
+        let sym = REBUS_BASE;
+        // C·RE·DO (4 cells), RE·DO → ·RE·DO (3 cells), CA·RE (3 cells)
+        let l4 = wl.len_data(4);
+        let v = l4.index_of(&[2, sym, 3, 14]).expect("C<RE>DO");
+        assert_eq!(wl.word(4, v), "CREDO");
+        assert_eq!(l4.scores[v], 80);
+        assert!(wl.len_data(3).index_of(&[sym, 3, 14]).is_some());
+        assert!(wl.len_data(3).index_of(&[2, 0, sym]).is_some());
+        // originals stay; words without RE get no variant
+        assert!(l4.index_of(&normalize_letters("REDO")).is_some());
+        assert!(wl.len_data(3).index_of(&normalize_letters("SOL")).is_none());
     }
 
     #[test]

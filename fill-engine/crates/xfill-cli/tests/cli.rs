@@ -83,9 +83,10 @@ fn xfill_fills_a_template_from_csv() {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    let auto = xfill_core::solver::auto_threads(cpus, usize::MAX);
     assert!(
-        stderr.contains(&format!("solving with {cpus} worker")),
-        "one worker per CPU by default: {stderr}"
+        stderr.contains(&format!("solving with {auto} worker")),
+        "automatic thread count by default: {stderr}"
     );
 }
 
@@ -272,6 +273,31 @@ fn bench_accepts_solver_variants() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("propagation arc"));
     let out = run(BENCH, &["--wordlist", s(&dict), "--propagation", "boh"]);
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn bench_threads_per_case() {
+    let d = TempDir::new("bench-threads");
+    let dict = write_dict(&d, 5);
+    let out = run(
+        BENCH,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--suite",
+            "smoke",
+            "--time",
+            "0.3",
+            "--threads",
+            "3",
+            "--parallel",
+            "split",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("3 threads per pattern"), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("2/2"));
 }
 
 #[test]
@@ -477,4 +503,376 @@ fn xfill_other_options_and_errors() {
         stdout.contains('6'),
         "6 letters possible per cell: {stdout}"
     );
+}
+
+#[test]
+fn xfill_exhaustive_reports_proof() {
+    let d = TempDir::new("exhaustive");
+    let dict = d.path("d.csv");
+    std::fs::write(&dict, "AB,a\nAC,b\nBA,c\nBD,d\nDA,e\n").unwrap();
+    let tpl = d.path("t.txt");
+    std::fs::write(&tpl, "..\n..\n").unwrap();
+    let out = run(
+        XFILL,
+        &[
+            s(&tpl),
+            "--wordlist",
+            s(&dict),
+            "--exhaustive",
+            "--workers",
+            "1",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("proven unfillable"), "{stdout}");
+}
+
+#[test]
+fn theme_list_with_theme_optimization() {
+    let d = TempDir::new("theme");
+    let dict = d.path("d.csv");
+    std::fs::write(&dict, "AAA,a\nAAA,b\nAAA,c\nBBB,d\nBBB,e\nCCC,f\n").unwrap();
+    let theme = d.path("theme.txt");
+    std::fs::write(&theme, "# tema\nccc\nzzz\n").unwrap();
+    let tpl = d.path("t.txt");
+    std::fs::write(&tpl, "...\n").unwrap();
+    let out = run(
+        XFILL,
+        &[
+            s(&tpl),
+            "--wordlist",
+            s(&dict),
+            "--optimize",
+            "theme",
+            "--theme-list",
+            s(&theme),
+            "--first",
+            "--workers",
+            "1",
+        ],
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stdout.lines().any(|l| l == "CCC"),
+        "theme word placed: {stdout}"
+    );
+    assert!(
+        stderr.contains("theme: 1 of 2 words in the dictionary"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("theme words used: 1"), "{stdout}");
+    let out = run(
+        XFILL,
+        &[s(&tpl), "--wordlist", s(&dict), "--theme-list", "/nope.txt"],
+    );
+    assert!(!out.status.success());
+
+    let out = run(
+        LIBRARY,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--size",
+            "3x3",
+            "--blocks",
+            "6",
+            "--candidates",
+            "2",
+            "--time",
+            "0.2",
+            "--top",
+            "1",
+            "--out",
+            s(&d.path("l.json")),
+            "--theme-list",
+            s(&theme),
+            "--optimize",
+            "theme",
+        ],
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("theme: 1 of 2"));
+}
+
+#[test]
+fn xfill_best_lists_ranked_fills() {
+    let d = TempDir::new("best");
+    let dict = write_dict(&d, 3);
+    let tpl = d.path("t.txt");
+    std::fs::write(&tpl, "...\n.#.\n...\n").unwrap();
+    let out = run(
+        XFILL,
+        &[
+            s(&tpl),
+            "--wordlist",
+            s(&dict),
+            "--best",
+            "3",
+            "--time",
+            "3",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for k in 1..=3 {
+        assert!(stdout.contains(&format!("#{k} mean ")), "{stdout}");
+    }
+    assert!(stdout.contains("(optimal)") || stdout.contains("(best found in time)"));
+    let means: Vec<f64> = stdout
+        .lines()
+        .filter_map(|l| l.split("mean ").nth(1))
+        .filter_map(|m| m.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert!(means.windows(2).all(|w| w[0] >= w[1]), "ranked: {means:?}");
+    let out = run(XFILL, &[s(&tpl), "--wordlist", s(&dict), "--best", "x"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn xfill_rebus_cells_and_free_rebus() {
+    let d = TempDir::new("rebus");
+    let dict = d.path("d.csv");
+    std::fs::write(&dict, "CREDO,Atto di fede\nREX,Re latino\n").unwrap();
+    let tpl = d.path("t.txt");
+    std::fs::write(&tpl, "C[RE]DO\n#.##\n").unwrap();
+    let out = run(
+        XFILL,
+        &[s(&tpl), "--wordlist", s(&dict), "--first", "--workers", "1"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("C[RE]DO"), "{stdout}");
+    assert!(stdout.contains("#X##"), "{stdout}");
+    let t2 = d.path("t2.txt");
+    std::fs::write(&t2, "....\n").unwrap();
+    let out = run(
+        XFILL,
+        &[s(&t2), "--wordlist", s(&dict), "--first", "--workers", "1"],
+    );
+    assert!(!out.status.success(), "no plain 4-letter word");
+    let out = run(
+        XFILL,
+        &[s(&t2), "--wordlist", s(&dict), "--first", "--rebus", "re"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("C[RE]DO"), "{stdout}");
+}
+
+#[test]
+fn xfill_analyze_reports_sections() {
+    let d = TempDir::new("sections");
+    let dict = d.path("d.csv");
+    std::fs::write(&dict, "AB,a\nCD,b\nAC,c\nBD,d\n").unwrap();
+    let tpl = d.path("t.txt");
+    std::fs::write(&tpl, "..#Z.\n..#..\n").unwrap();
+    let out = run(
+        XFILL,
+        &[s(&tpl), "--wordlist", s(&dict), "--analyze", "--time", "1"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("sections: 2"), "{stdout}");
+    assert!(
+        stdout.contains(": fillable") && stdout.contains(": impossible"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn xfill_suggest_lists_candidates_and_forced_words() {
+    let d = TempDir::new("suggest");
+    let dict = d.path("d.csv");
+    std::fs::write(&dict, "XAB,a\nYAB,b\nYAB,b2\nXZ,c\nYZ,d\nYZ,e\nYZ,f\n").unwrap();
+    let tpl = d.path("t.txt");
+    std::fs::write(&tpl, ".AB\nZ##\n").unwrap();
+    let out = run(
+        XFILL,
+        &[
+            s(&tpl),
+            "--wordlist",
+            s(&dict),
+            "--suggest",
+            "0,0,A",
+            "--suggest-check",
+            "1",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let first = stdout.lines().find(|l| l.contains("score")).unwrap_or("");
+    assert!(first.contains("YAB"), "ranked first: {stdout}");
+    assert!(stdout.contains("fillable"), "{stdout}");
+    let out = run(
+        XFILL,
+        &[s(&tpl), "--wordlist", s(&dict), "--suggest", "9,9,A"],
+    );
+    assert!(!out.status.success());
+    let out = run(
+        XFILL,
+        &[s(&tpl), "--wordlist", s(&dict), "--suggest", "0,0"],
+    );
+    assert!(!out.status.success());
+}
+
+const PAROLE: &str = env!("CARGO_BIN_EXE_parole");
+
+#[test]
+fn parole_pattern_and_anagram() {
+    let d = TempDir::new("parole");
+    let dict = d.path("d.csv");
+    std::fs::write(
+        &dict,
+        "CASA,Abitazione\nCOSA,Oggetto\nROMA,Capitale\nAMOR,Amore latino\nRAMO,Parte d'albero\n",
+    )
+    .unwrap();
+    let out = run(
+        PAROLE,
+        &["pattern", "c?sa", "--wordlist", s(&dict), "--clues"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("CASA") && stdout.contains("COSA"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Abitazione"), "clues shown: {stdout}");
+    let out = run(PAROLE, &["anagram", "roma", "--wordlist", s(&dict)]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for w in ["ROMA", "AMOR", "RAMO"] {
+        assert!(stdout.contains(w), "{stdout}");
+    }
+    let out = run(
+        PAROLE,
+        &[
+            "anagram",
+            "casaroma",
+            "--words",
+            "2",
+            "--wordlist",
+            s(&dict),
+        ],
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("CASA ROMA"));
+    let out = run(PAROLE, &["pattern", "[ab", "--wordlist", s(&dict)]);
+    assert!(!out.status.success());
+    let out = run(PAROLE, &["boh"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn library_generator_constraint_options() {
+    let d = TempDir::new("gen-opts");
+    let dict = write_dict(&d, 5);
+    let json = d.path("l.json");
+    let out = run(
+        LIBRARY,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--size",
+            "7x7",
+            "--blocks",
+            "10",
+            "--candidates",
+            "3",
+            "--time",
+            "0.3",
+            "--top",
+            "1",
+            "--out",
+            s(&json),
+            "--max-len",
+            "5",
+            "--min-len-count",
+            "5:2",
+            "--max-full-words",
+            "0",
+            "--require-lengths",
+            "4,3",
+            "--max-white-rect",
+            "20",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("constraints:"), "{stderr}");
+    let text = std::fs::read_to_string(&json).unwrap();
+    let lens: Vec<usize> = text
+        .split("\"len\": ")
+        .skip(1)
+        .filter_map(|x| x.split(',').next()?.parse().ok())
+        .collect();
+    assert!(lens.iter().filter(|&&l| l == 5).count() >= 2, "{lens:?}");
+    let out = run(LIBRARY, &["--wordlist", s(&dict), "--min-len-count", "x"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = run(
+        LIBRARY,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--size",
+            "7x7",
+            "--blocks",
+            "14",
+            "--lattice",
+            "--candidates",
+            "2",
+            "--time",
+            "0.3",
+            "--top",
+            "1",
+            "--out",
+            s(&json),
+        ],
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("lattice"));
+}
+
+#[test]
+fn library_llm_clue_options() {
+    let d = TempDir::new("llm");
+    let dict = write_dict(&d, 4);
+    let out = run(
+        LIBRARY,
+        &[
+            "--wordlist",
+            s(&dict),
+            "--llm-clues",
+            "missing",
+            "--llm-config",
+            "/nonexistent/llm.txt",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot read LLM config"), "{stderr}");
+    let out = run(
+        LIBRARY,
+        &["--wordlist", s(&dict), "--llm-clues", "talvolta"],
+    );
+    assert_eq!(out.status.code(), Some(2));
 }

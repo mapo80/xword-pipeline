@@ -143,6 +143,19 @@ pub fn run_case(case: &Case, wl: &Wordlist, cfg: &SolveConfig) -> CaseResult {
     result_of(case.spec, &r)
 }
 
+/// Like [`run_case`], solving the pattern with `threads` threads (see
+/// [`crate::solver::solve_portfolio`]).
+pub fn run_case_threads(
+    case: &Case,
+    wl: &Wordlist,
+    cfg: &SolveConfig,
+    threads: usize,
+) -> CaseResult {
+    let p = Puzzle::from_template(&case.template);
+    let r = crate::solver::solve_portfolio(&p, wl, &[], cfg, threads).expect("no locks");
+    result_of(case.spec, &r)
+}
+
 /// Quality stats of the fill that would be published: the clean track when
 /// present (as `library` does), else the mean-best fill.
 fn result_of(spec: &'static str, r: &SolveResult) -> CaseResult {
@@ -339,11 +352,25 @@ mod tests {
             weak_count: Some(3),
             fill: Some(Vec::new()),
             clean: Some(clean),
+            proven_unfillable: false,
         };
         let c = result_of("x", &r);
         assert_eq!((c.mean, c.weak), (Some(75.0), Some(0)));
         let r = SolveResult { clean: None, ..r };
         assert_eq!(result_of("x", &r).weak, Some(3));
+    }
+
+    #[test]
+    fn run_case_with_threads() {
+        let wl = synth();
+        let cases = build_suite(SMOKE, &wl, 3);
+        let cfg = SolveConfig {
+            time_limit_s: 1.0,
+            stop_on_first: true,
+            ..Default::default()
+        };
+        let r = run_case_threads(&cases[0], &wl, &cfg, 3);
+        assert!(r.solved);
     }
 
     #[test]

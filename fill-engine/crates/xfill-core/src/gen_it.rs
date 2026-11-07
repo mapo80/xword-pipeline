@@ -76,6 +76,18 @@ pub struct ItGenConfig {
     pub max_two_letter_pct: Option<u8>,
     /// Search mode: node budget per try (0 = unlimited).
     pub search_budget: usize,
+    /// At least N entries of length L, for each (L, N).
+    pub min_len_counts: Vec<(usize, usize)>,
+    /// At most this many entries spanning a whole row or column.
+    pub max_full_words: Option<usize>,
+    /// Entry lengths that must be present (with multiplicity), e.g. to
+    /// host theme words.
+    pub require_lengths: Vec<usize>,
+    /// Largest all-white rectangle area allowed.
+    pub max_white_rect: Option<usize>,
+    /// Start from a lattice of blacks in every (odd row, odd column) cell
+    /// (with their symmetric partners).
+    pub lattice: bool,
 }
 
 impl ItGenConfig {
@@ -92,6 +104,11 @@ impl ItGenConfig {
             mode: GenMode::Random,
             max_two_letter_pct: None,
             search_budget: 20_000,
+            min_len_counts: Vec::new(),
+            max_full_words: None,
+            require_lengths: Vec::new(),
+            max_white_rect: None,
+            lattice: false,
         }
     }
 }
@@ -338,30 +355,93 @@ fn complete_ok(cfg: &ItGenConfig, p: &Pattern) -> bool {
     {
         return false;
     }
-    match cfg.max_two_letter_pct {
-        None => true,
-        Some(pct) => {
-            let (mut entries, mut two) = (0usize, 0usize);
-            for r in 0..p.rows {
-                for c in 0..p.cols {
-                    if p.is_black(r, c) {
-                        continue;
-                    }
-                    let (h, v) = runs[p.idx(r, c)];
-                    // count each run once, at its first cell
-                    if h >= 2 && (c == 0 || p.is_black(r, c - 1)) {
-                        entries += 1;
-                        two += (h == 2) as usize;
-                    }
-                    if v >= 2 && (r == 0 || p.is_black(r - 1, c)) {
-                        entries += 1;
-                        two += (v == 2) as usize;
-                    }
-                }
+    // entry lengths (each run counted once, at its first cell) and how many
+    // span a whole row or column
+    let mut lens: Vec<usize> = Vec::new();
+    let mut full = 0usize;
+    for r in 0..p.rows {
+        for c in 0..p.cols {
+            if p.is_black(r, c) {
+                continue;
             }
-            two * 100 <= pct as usize * entries
+            let (h, v) = runs[p.idx(r, c)];
+            if h >= 2 && (c == 0 || p.is_black(r, c - 1)) {
+                lens.push(h);
+                full += (h == p.cols) as usize;
+            }
+            if v >= 2 && (r == 0 || p.is_black(r - 1, c)) {
+                lens.push(v);
+                full += (v == p.rows) as usize;
+            }
         }
     }
+    let count = |l: usize| lens.iter().filter(|&&x| x == l).count();
+    if let Some(pct) = cfg.max_two_letter_pct {
+        if count(2) * 100 > pct as usize * lens.len() {
+            return false;
+        }
+    }
+    if cfg.min_len_counts.iter().any(|&(l, n)| count(l) < n) {
+        return false;
+    }
+    let mut required: Vec<usize> = cfg.require_lengths.clone();
+    required.sort_unstable();
+    required.dedup();
+    if required
+        .iter()
+        .any(|&l| count(l) < cfg.require_lengths.iter().filter(|&&x| x == l).count())
+    {
+        return false;
+    }
+    if cfg.max_full_words.is_some_and(|m| full > m) {
+        return false;
+    }
+    if cfg.max_white_rect.is_some_and(|a| max_white_rect(p) > a) {
+        return false;
+    }
+    true
+}
+
+/// Area of the largest all-white rectangle (histogram + stack per row).
+fn max_white_rect(p: &Pattern) -> usize {
+    let mut heights = vec![0usize; p.cols];
+    let mut best = 0;
+    for r in 0..p.rows {
+        for (c, h) in heights.iter_mut().enumerate() {
+            *h = if p.is_black(r, c) { 0 } else { *h + 1 };
+        }
+        let mut stack: Vec<usize> = Vec::new();
+        for c in 0..=p.cols {
+            let h = if c < p.cols { heights[c] } else { 0 };
+            while let Some(&top) = stack.last() {
+                if heights[top] <= h {
+                    break;
+                }
+                stack.pop();
+                let left = stack.last().map_or(0, |&l| l + 1);
+                best = best.max(heights[top] * (c - left));
+            }
+            stack.push(c);
+        }
+    }
+    best
+}
+
+/// The starting pattern: empty, or the lattice (with symmetric partners).
+fn initial_pattern(cfg: &ItGenConfig) -> (Pattern, usize) {
+    let mut p = Pattern::empty(cfg.rows, cfg.cols);
+    if cfg.lattice {
+        for r in (1..cfg.rows).step_by(2) {
+            for c in (1..cfg.cols).step_by(2) {
+                for (a, b) in orbit(cfg, r, c) {
+                    let i = p.idx(a, b);
+                    p.black[i] = true;
+                }
+            }
+        }
+    }
+    let placed = p.black.iter().filter(|b| **b).count();
+    (p, placed)
 }
 
 fn unit(rng: &mut Rng) -> f64 {
@@ -414,8 +494,7 @@ pub fn check_template(template: &str, max_len: usize) -> Result<(), String> {
 
 /// One attempt at building a pattern. `None` if this random walk got stuck.
 fn try_once(cfg: &ItGenConfig, rng: &mut Rng) -> Option<String> {
-    let mut p = Pattern::empty(cfg.rows, cfg.cols);
-    let mut placed = 0usize;
+    let (mut p, mut placed) = initial_pattern(cfg);
     let mut stalls = 0usize;
     let n = cfg.rows * cfg.cols;
     while placed < cfg.blacks && stalls < 4 * n {
@@ -555,8 +634,8 @@ fn search_once(cfg: &ItGenConfig, rng: &mut Rng) -> Found {
         visited: std::collections::HashSet::new(),
         nodes: 0,
     };
-    let mut p = Pattern::empty(cfg.rows, cfg.cols);
-    s.dfs(&mut p, 0)
+    let (mut p, placed) = initial_pattern(cfg);
+    s.dfs(&mut p, placed)
 }
 
 /// Generate a valid pattern with up to `max_tries` tries (random walks, or
@@ -722,5 +801,101 @@ mod tests {
         assert_eq!(GenMode::parse("search"), Some(GenMode::Search));
         assert_eq!(GenMode::parse("random"), Some(GenMode::Random));
         assert_eq!(GenMode::parse("x"), None);
+    }
+
+    // ---- punto 25: vincoli del generatore ----
+
+    fn search_cfg(rows: usize, cols: usize, blacks: usize) -> ItGenConfig {
+        ItGenConfig {
+            mode: GenMode::Search,
+            ..ItGenConfig::new(rows, cols, blacks)
+        }
+    }
+
+    fn entry_lens(t: &str) -> Vec<usize> {
+        Puzzle::from_template(t)
+            .entries
+            .iter()
+            .map(|e| e.len)
+            .collect()
+    }
+
+    #[test]
+    fn min_count_per_length() {
+        let c = ItGenConfig {
+            min_len_counts: vec![(7, 3)],
+            ..search_cfg(9, 9, 12)
+        };
+        let t = generate_it(&c, &mut Rng::new(2), 20).expect("pattern");
+        assert!(
+            entry_lens(&t).iter().filter(|&&l| l == 7).count() >= 3,
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn no_full_width_words() {
+        let c = ItGenConfig {
+            max_full_words: Some(0),
+            ..search_cfg(9, 9, 12)
+        };
+        let t = generate_it(&c, &mut Rng::new(4), 20).expect("pattern");
+        let p = Puzzle::from_template(&t);
+        assert!(p.entries.iter().all(|e| e.len < 9), "{t}");
+    }
+
+    #[test]
+    fn required_lengths_are_present() {
+        let c = ItGenConfig {
+            require_lengths: vec![8, 8, 6],
+            ..search_cfg(11, 11, 20)
+        };
+        let t = generate_it(&c, &mut Rng::new(6), 20).expect("pattern");
+        let lens = entry_lens(&t);
+        assert!(lens.iter().filter(|&&l| l == 8).count() >= 2, "{t}");
+        assert!(lens.contains(&6), "{t}");
+    }
+
+    #[test]
+    fn largest_white_rectangle() {
+        let p = Pattern {
+            rows: 3,
+            cols: 4,
+            black: "..#.....#...".chars().map(|c| c == '#').collect(),
+        };
+        // rows: ..#. / .... / #... → largest all-white rectangle: 2x3 = 6
+        assert_eq!(max_white_rect(&p), 6);
+        let c = ItGenConfig {
+            max_white_rect: Some(12),
+            ..search_cfg(9, 9, 16)
+        };
+        let t = generate_it(&c, &mut Rng::new(8), 20).expect("pattern");
+        let rows: Vec<&str> = t.lines().collect();
+        let pat = Pattern {
+            rows: 9,
+            cols: 9,
+            black: rows
+                .iter()
+                .flat_map(|r| r.chars())
+                .map(|c| c == '#')
+                .collect(),
+        };
+        assert!(max_white_rect(&pat) <= 12, "{t}");
+    }
+
+    #[test]
+    fn lattice_blacks_every_other_cell() {
+        let c = ItGenConfig {
+            lattice: true,
+            max_len: 9,
+            ..search_cfg(9, 9, 20)
+        };
+        let t = generate_it(&c, &mut Rng::new(1), 20).expect("pattern");
+        let g: Vec<Vec<char>> = t.lines().map(|l| l.chars().collect()).collect();
+        for r in (1..9).step_by(2) {
+            for col in (1..9).step_by(2) {
+                assert_eq!(g[r][col], '#', "lattice cell r{r}c{col}\n{t}");
+            }
+        }
     }
 }

@@ -4,7 +4,7 @@
 
 use std::process::ExitCode;
 use std::time::Instant;
-use xfill_core::clues::load_clue_csv;
+use xfill_core::clues::load_clue_csv_rebus;
 use xfill_core::grid::Dir;
 use xfill_core::{Lock, Puzzle, SolveConfig, Solver};
 
@@ -20,6 +20,11 @@ struct Args {
     workers: usize,
     locks: Vec<Lock>,
     analyze: bool,
+    theme_list: Option<String>,
+    best: usize,
+    rebus: Vec<String>,
+    suggest: Option<String>,
+    suggest_check: f64,
 }
 
 /// Parse a `--lock` value "ROW,COL,DIR,ANSWER" (DIR is A/Across or D/Down).
@@ -53,11 +58,19 @@ fn parse_args() -> Result<Args, String> {
         tiers: SolveConfig::default().tiers,
         first: false,
         boxed: false,
-        workers: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        workers: xfill_core::solver::auto_threads(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            usize::MAX,
+        ),
         locks: Vec::new(),
         analyze: false,
+        theme_list: None,
+        best: 0,
+        rebus: Vec::new(),
+        suggest: None,
+        suggest_check: 0.0,
     };
     let mut it = std::env::args().skip(1);
     let mut got_template = false;
@@ -96,10 +109,36 @@ fn parse_args() -> Result<Args, String> {
             "--first" => a.first = true,
             "--boxed" => a.boxed = true,
             "--analyze" => a.analyze = true,
+            "--suggest" => a.suggest = Some(it.next().ok_or("--suggest needs ROW,COL,DIR")?),
+            "--suggest-check" => {
+                a.suggest_check = it
+                    .next()
+                    .ok_or("--suggest-check needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --suggest-check")?
+            }
+            "--rebus" => {
+                a.rebus = it
+                    .next()
+                    .ok_or("--rebus needs a value")?
+                    .split(',')
+                    .map(|r| r.trim().to_ascii_uppercase())
+                    .filter(|r| !r.is_empty())
+                    .collect()
+            }
+            "--best" => {
+                a.best = it
+                    .next()
+                    .ok_or("--best needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --best")?
+            }
+            "--theme-list" => a.theme_list = Some(it.next().ok_or("--theme-list needs a value")?),
             // solver variants: validated by SolveConfig::with_args in main
             f if xfill_core::solver::SOLVER_FLAGS.contains(&f) => {
                 it.next();
             }
+            f if xfill_core::solver::SOLVER_SWITCHES.contains(&f) => {}
             "--workers" => {
                 a.workers = it
                     .next()
@@ -134,8 +173,22 @@ fn main() -> ExitCode {
         }
     };
 
+    let text = match std::fs::read_to_string(&args.template) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("failed to read template {}: {e}", args.template);
+            return ExitCode::FAILURE;
+        }
+    };
+    // rebus symbols: the template's [..] cells, then the free --rebus ones
+    let mut rebus = xfill_core::grid::rebus_strings(&text);
+    for r in &args.rebus {
+        if !rebus.contains(r) {
+            rebus.push(r.clone());
+        }
+    }
     let t = Instant::now();
-    let wl = match load_clue_csv(&args.wordlist, args.min_score) {
+    let wl = match load_clue_csv_rebus(&args.wordlist, args.min_score, &rebus) {
         Ok((w, _clues)) => w,
         Err(e) => {
             eprintln!("failed to load wordlist {}: {e}", args.wordlist);
@@ -151,14 +204,7 @@ fn main() -> ExitCode {
         t.elapsed().as_secs_f64()
     );
 
-    let text = match std::fs::read_to_string(&args.template) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("failed to read template {}: {e}", args.template);
-            return ExitCode::FAILURE;
-        }
-    };
-    let p = Puzzle::from_template(&text);
+    let p = Puzzle::from_template_with_rebus(&text, &rebus);
     eprintln!(
         "grid: {}x{} blocks={} cells={} entries={} orphans={}",
         p.rows,
@@ -170,7 +216,7 @@ fn main() -> ExitCode {
     );
 
     let cli: Vec<String> = std::env::args().skip(1).collect();
-    let cfg = match (SolveConfig {
+    let mut cfg = match (SolveConfig {
         time_limit_s: args.time_limit,
         tiers: args.tiers,
         seed: args.seed,
@@ -185,7 +231,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    cfg.free_rebus = args.rebus.clone();
     eprintln!("solver: {}", cfg.describe());
+    if let Some(path) = &args.theme_list {
+        match xfill_core::solver::load_theme(path, &wl) {
+            Ok((ids, total)) => {
+                eprintln!("theme: {} of {total} words in the dictionary", ids.len());
+                cfg.theme = std::sync::Arc::new(ids);
+            }
+            Err(e) => {
+                eprintln!("error: cannot read theme list {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     // Validate theme locks once up front (clear error if a spec is wrong).
     if let Err(e) = Solver::with_locks(&p, &wl, &args.locks) {
@@ -215,7 +274,95 @@ fn main() -> ExitCode {
         );
     }
 
+    if let Some(spec) = &args.suggest {
+        let parsed = parse_lock(&format!("{spec},X"))
+            .ok()
+            .and_then(|l| p.find_entry(l.row, l.col, l.dir));
+        let Some(ei) = parsed else {
+            eprintln!("error: --suggest '{spec}' is not the start of an entry (ROW,COL,A|D)");
+            return ExitCode::FAILURE;
+        };
+        let mut solver = Solver::with_locks(&p, &wl, &args.locks).unwrap();
+        let sug = solver.suggest(ei, 30, args.suggest_check);
+        for c in &sug.candidates {
+            let check = match c.fillable {
+                Some(true) => "  fillable",
+                Some(false) => "  dead end",
+                None if args.suggest_check > 0.0 => "  ?",
+                None => "",
+            };
+            println!(
+                "{:<16} score {:>4}  fill score {:>7.1}{check}",
+                c.word, c.score, c.fill_score
+            );
+        }
+        for (e, w) in &sug.forced {
+            let en = &p.entries[*e];
+            let d = if en.dir == xfill_core::grid::Dir::Across {
+                "A"
+            } else {
+                "D"
+            };
+            println!("forced: {w} ({d} r{}c{})", en.row, en.col);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if args.best > 0 {
+        let mut solver = Solver::with_locks(&p, &wl, &args.locks).unwrap();
+        let (fills, optimal) = solver.best_fills(&cfg, args.best);
+        for (k, f) in fills.iter().enumerate() {
+            println!(
+                "#{} mean {:.2}  min {}  weak {}",
+                k + 1,
+                f.mean_score,
+                f.min_score,
+                f.weak_count
+            );
+            println!("{}\n", p.render(Some(&f.letters)));
+        }
+        println!(
+            "{} fill(s) {}",
+            fills.len(),
+            if optimal {
+                "(optimal)"
+            } else {
+                "(best found in time)"
+            }
+        );
+        return if fills.is_empty() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+
     if args.analyze {
+        let sections = xfill_core::insight::analyze_sections(
+            &p,
+            &wl,
+            &SolveConfig {
+                stop_on_first: true,
+                ..cfg.clone()
+            },
+            &mut xfill_core::insight::SectionCache::default(),
+        );
+        println!("sections: {}", sections.len());
+        for (k, sec) in sections.iter().enumerate() {
+            let verdict = match sec.verdict {
+                xfill_core::insight::Verdict::Fillable => "fillable",
+                xfill_core::insight::Verdict::Impossible => "impossible",
+                xfill_core::insight::Verdict::Uncertain => "uncertain",
+            };
+            let first = &p.entries[sec.entries[0]];
+            println!(
+                "section {} ({} entries, from r{}c{}): {verdict}",
+                k + 1,
+                sec.entries.len(),
+                first.row,
+                first.col
+            );
+        }
         return print_analysis(
             &p,
             &Solver::with_locks(&p, &wl, &args.locks).unwrap().analyze(),
@@ -249,6 +396,23 @@ fn main() -> ExitCode {
         "reason: {}  nodes: {}  restarts: {}  elapsed: {:.3}s  ({:.0} nodes/s)",
         r.reason, r.nodes, r.restarts, r.elapsed_s, rate
     );
+    if args.theme_list.is_some() {
+        let used = r.fill.as_ref().map_or(0, |f| {
+            f.iter()
+                .filter(|(ei, w, _)| {
+                    let len = p.entries[*ei].len;
+                    let letters: Vec<u8> = w.bytes().map(|b| b - b'A').collect();
+                    wl.len_data(len)
+                        .index_of(&letters)
+                        .is_some_and(|i| cfg.theme.contains(&(len, i)))
+                })
+                .count()
+        });
+        println!("theme words used: {used}");
+    }
+    if r.proven_unfillable {
+        println!("proven unfillable: no fill exists with this word list");
+    }
     if let (Some(mean), Some(min), Some(fill)) = (r.mean_score, r.min_score, r.fill.as_ref()) {
         println!(
             "mean score: {:.1}  min: {}  weak(<{}): {}/{}",

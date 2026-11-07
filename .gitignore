@@ -9,3 +9,6 @@ fill-engine/target/
 *.log
 .env
 
+
+# credenziali LLM locali
+.alibaba

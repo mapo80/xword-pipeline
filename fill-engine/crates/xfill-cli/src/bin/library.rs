@@ -6,6 +6,9 @@
 //! Usage: library [--wordlist PATH] [--size RxC] [--blocks N]
 //!                [--symmetry none|rot|mirror] [--max-len N] [--no-adjacent]
 //!                [--gen random|search] [--max-two-letter PCT]
+//!                [--min-len-count L:N,…] [--require-lengths L,…]
+//!                [--max-full-words N] [--max-white-rect A] [--lattice]
+//!                [--llm-clues off|missing|all] [--llm-config FILE] [--llm-model M]
 //!                [--candidates N] [--time SECS] [--keep-mean F]
 //!                [--weak-bar N] [--max-weak N] [--per-shape N] [--top N]
 //!                [--seed N] [--workers N] [--out PATH]
@@ -16,7 +19,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
-use xfill_core::clues::load_clue_csv;
+use xfill_core::clues::load_clue_csv_rebus;
 use xfill_core::gen_it::{generate_it, GenMode, ItGenConfig, Symmetry};
 use xfill_core::library::{build_lib_grid, write_json, LibGrid};
 use xfill_core::util::Rng;
@@ -88,8 +91,32 @@ fn main() {
     let seed: u64 = arg("--seed", 1);
     let out: String = arg("--out", "../out/libraries/grid-library.json".to_string());
     let pdf_dir: String = arg("--pdf", String::new());
+    // LLM clues: off (default), missing (only words without a clue in the
+    // database), all (every word); credentials file: URL, then API key.
+    let llm_mode: String = arg("--llm-clues", "off".to_string());
+    let llm_all = match llm_mode.as_str() {
+        "off" | "missing" => false,
+        "all" => true,
+        _ => {
+            eprintln!("error: bad --llm-clues '{llm_mode}' (use off, missing or all)");
+            std::process::exit(2);
+        }
+    };
+    let llm = if llm_mode == "off" {
+        None
+    } else {
+        let path: String = arg("--llm-config", "../../.alibaba".to_string());
+        let model: String = arg("--llm-model", "qwen3.8-flash".to_string());
+        match xfill_core::llm::LlmConfig::load(&path, &model) {
+            Ok(cfg) => Some(xfill_core::llm::CurlClient { cfg, max_chars: 40 }),
+            Err(e) => {
+                eprintln!("error: cannot read LLM config {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
     let cli: Vec<String> = std::env::args().skip(1).collect();
-    let base_cfg = match SolveConfig::default().with_args(&cli) {
+    let mut base_cfg = match SolveConfig::default().with_args(&cli) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -105,7 +132,14 @@ fn main() {
 
     eprintln!("solver: {}", base_cfg.describe());
     let t = Instant::now();
-    let (wl, clues) = match load_clue_csv(&wordlist, 0) {
+    // free rebus strings the solver may place in any cell
+    let rebus: Vec<String> = arg("--rebus", String::new())
+        .split(',')
+        .map(|r| r.trim().to_ascii_uppercase())
+        .filter(|r| !r.is_empty())
+        .collect();
+    base_cfg.free_rebus = rebus.clone();
+    let (wl, clues) = match load_clue_csv_rebus(&wordlist, 0, &rebus) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("error: cannot load wordlist {wordlist}: {e}");
@@ -114,11 +148,67 @@ fn main() {
     };
     // Never ask for runs longer than the dictionary's longest word.
     let max_len = max_len_arg.min(wl.longest());
+    let theme_list: String = arg("--theme-list", String::new());
+    if !theme_list.is_empty() {
+        match xfill_core::solver::load_theme(&theme_list, &wl) {
+            Ok((ids, total)) => {
+                eprintln!("theme: {} of {total} words in the dictionary", ids.len());
+                base_cfg.theme = std::sync::Arc::new(ids);
+            }
+            Err(e) => {
+                eprintln!("error: cannot read theme list {theme_list}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let total: usize = wl.by_len.iter().map(|l| l.n).sum();
     eprintln!(
         "wordlist: {total} words loaded in {:.1}s",
         t.elapsed().as_secs_f64()
     );
+
+    // Generator constraints
+    let list = |name: &str| -> Result<Vec<usize>, String> {
+        let v: String = arg(name, String::new());
+        v.split(',')
+            .filter(|x| !x.trim().is_empty())
+            .map(|x| x.trim().parse().map_err(|_| format!("bad {name} '{v}'")))
+            .collect()
+    };
+    let parsed = (|| -> Result<_, String> {
+        let min_len_counts: Vec<(usize, usize)> = {
+            let v: String = arg("--min-len-count", String::new());
+            v.split(',')
+                .filter(|x| !x.trim().is_empty())
+                .map(|x| {
+                    let (l, n) = x
+                        .split_once(':')
+                        .ok_or(format!("bad --min-len-count '{v}' (use L:N,…)"))?;
+                    Ok((
+                        l.trim()
+                            .parse()
+                            .map_err(|_| format!("bad --min-len-count '{v}'"))?,
+                        n.trim()
+                            .parse()
+                            .map_err(|_| format!("bad --min-len-count '{v}'"))?,
+                    ))
+                })
+                .collect::<Result<_, String>>()?
+        };
+        Ok((min_len_counts, list("--require-lengths")?))
+    })();
+    let (min_len_counts, require_lengths) = match parsed {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let max_full_words: Option<usize> =
+        flag("--max-full-words").then(|| arg("--max-full-words", usize::MAX));
+    let max_white_rect: Option<usize> =
+        flag("--max-white-rect").then(|| arg("--max-white-rect", usize::MAX));
+    let lattice = flag("--lattice");
 
     // Phase 1: generate candidate patterns + fixed per-grid seeds.
     let gen_cfg = ItGenConfig {
@@ -127,8 +217,22 @@ fn main() {
         allow_adjacent,
         mode: gen_mode,
         max_two_letter_pct,
+        min_len_counts,
+        max_full_words,
+        require_lengths,
+        max_white_rect,
+        lattice,
         ..ItGenConfig::new(rows, cols, blocks)
     };
+    eprintln!(
+        "constraints: min-len-count {:?}, require-lengths {:?}, max-full-words {:?}, \
+         max-white-rect {:?}{}",
+        gen_cfg.min_len_counts,
+        gen_cfg.require_lengths,
+        gen_cfg.max_full_words,
+        gen_cfg.max_white_rect,
+        if gen_cfg.lattice { ", lattice" } else { "" }
+    );
     let mut rng = Rng::new(seed);
     let mut jobs: Vec<(String, u64)> = Vec::with_capacity(candidates);
     let mut tries = 0usize;
@@ -141,7 +245,7 @@ fn main() {
         let Some(tpl) = generate_it(&gen_cfg, &mut rng, 50) else {
             continue;
         };
-        let p = Puzzle::from_template(&tpl);
+        let p = Puzzle::from_template_with_rebus(&tpl, &wl.rebus);
         // every entry length must exist in the word list
         if p.orphan_cells() > 0 || p.entries.iter().any(|e| wl.len_data(e.len).n == 0) {
             continue;
@@ -190,7 +294,7 @@ fn main() {
                     break;
                 }
                 let (tpl, jseed) = &jobs[i];
-                let p = Puzzle::from_template(tpl);
+                let p = Puzzle::from_template_with_rebus(tpl, &wl.rebus);
                 let cfg = SolveConfig {
                     time_limit_s: time,
                     seed: *jseed,
@@ -238,6 +342,25 @@ fn main() {
     for g in &mut kept {
         for e in &mut g.entries {
             e.clue = clues.pick_clue(&e.answer, |n| crng.below(n));
+        }
+    }
+    // then the language model, for missing (or all) clues
+    if let Some(client) = &llm {
+        for g in &mut kept {
+            let mut items: Vec<(String, Option<String>)> = g
+                .entries
+                .iter()
+                .map(|e| (e.answer.clone(), e.clue.clone()))
+                .collect();
+            match xfill_core::llm::fill_clues(&mut items, client, llm_all) {
+                Ok(n) => {
+                    eprintln!("llm: {n} clue(s) written by {}", client.cfg.model);
+                    for (e, (_, c)) in g.entries.iter_mut().zip(items) {
+                        e.clue = c;
+                    }
+                }
+                Err(err) => eprintln!("warning: LLM clues skipped: {err}"),
+            }
         }
     }
 

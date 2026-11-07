@@ -1,7 +1,8 @@
 //! Benchmark the solver on a fixed suite of Italian-style patterns.
 //!
 //! Usage: bench [--wordlist PATH] [--suite standard|smoke] [--time SECS]
-//!              [--mode first|quality] [--seed N] [--workers N] [--verbose]
+//!              [--mode first|quality] [--seed N] [--workers N] [--threads T]
+//!              [--verbose]
 //!
 //! `first` measures fill power (time to the first complete fill);
 //! `quality` runs the full quality search for `--time` seconds per pattern.
@@ -9,7 +10,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use xfill_core::bench::{
-    build_suite, format_table, run_case, suite_by_name, summarize, CaseResult,
+    build_suite, format_table, run_case, run_case_threads, suite_by_name, summarize, CaseResult,
 };
 use xfill_core::clues::load_clue_csv;
 use xfill_core::SolveConfig;
@@ -39,6 +40,7 @@ fn main() {
     let mode: String = arg("--mode", "first".to_string());
     let seed: u64 = arg("--seed", 1);
     let verbose = flag("--verbose");
+    let threads: usize = arg("--threads", 1);
     let workers: usize = arg(
         "--workers",
         std::thread::available_parallelism()
@@ -81,7 +83,8 @@ fn main() {
         }
     };
     eprintln!(
-        "suite {suite_name}: {} patterns, mode {mode}, {time}s each, {workers} workers, {}",
+        "suite {suite_name}: {} patterns, mode {mode}, {time}s each, {workers} workers, \
+         {threads} threads per pattern, {}",
         cases.len(),
         cfg.describe()
     );
@@ -97,7 +100,11 @@ fn main() {
                 }
                 let mut c = cfg.clone();
                 c.seed = seed.wrapping_add(i as u64);
-                let r = run_case(&cases[i], &wl, &c);
+                let r = if threads > 1 {
+                    run_case_threads(&cases[i], &wl, &c, threads)
+                } else {
+                    run_case(&cases[i], &wl, &c)
+                };
                 if verbose {
                     eprintln!(
                         "  {:<10} #{i:<3} {} {:.3}s nodes={}",

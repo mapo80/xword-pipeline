@@ -15,7 +15,7 @@
 use crate::bitset::Bitset;
 use crate::grid::{Dir, Puzzle};
 use crate::util::Rng;
-use crate::wordlist::Wordlist;
+use crate::wordlist::{Wordlist, ALPHA, REBUS_BASE};
 use std::time::Instant;
 
 /// A theme / pre-placed answer: lock the entry starting at (row, col) in `dir`
@@ -49,6 +49,170 @@ impl Propagation {
     }
 }
 
+/// How several threads share one grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parallel {
+    /// Independent searches with different seeds.
+    Portfolio,
+    /// The first entry's candidates divided among the threads.
+    Split,
+}
+
+impl Parallel {
+    pub fn parse(s: &str) -> Option<Parallel> {
+        match s {
+            "portfolio" => Some(Parallel::Portfolio),
+            "split" => Some(Parallel::Split),
+            _ => None,
+        }
+    }
+}
+
+/// Threads for a grid: one CPU left free, at most 8, never more than the
+/// first entry's candidates.
+pub fn auto_threads(cpus: usize, first_candidates: usize) -> usize {
+    cpus.saturating_sub(1)
+        .clamp(1, 8)
+        .min(first_candidates.max(1))
+}
+
+/// The entry the search would fill first and its in-tier candidates divided
+/// round-robin (in score order, so every part gets good words) into `k`
+/// disjoint parts.
+pub fn split_first_entry(
+    p: &Puzzle,
+    wl: &Wordlist,
+    locks: &[Lock],
+    cfg: &SolveConfig,
+    k: usize,
+) -> Result<(usize, Vec<Bitset>), String> {
+    let mut probe = Solver::with_locks(p, wl, locks)?;
+    probe.propagation = cfg.propagation;
+    let floor = cfg.tiers.iter().copied().min().unwrap_or(0);
+    probe.reset(floor);
+    if probe.propagation == Propagation::Arc {
+        probe.propagate_all();
+    }
+    let ei = probe.select_entry().ok_or("nothing to fill")?;
+    let n = wl.len_data(p.entries[ei].len).n.max(1);
+    let mut parts = vec![Bitset::zeros(n); k.max(1)];
+    let cutoff = probe.cutoff_by_entry[ei];
+    for (i, w) in probe.domains[ei]
+        .iter_ones()
+        .take_while(|&w| w < cutoff)
+        .enumerate()
+    {
+        let k = parts.len();
+        parts[i % k].set(w);
+    }
+    Ok((ei, parts))
+}
+
+/// How candidates are ordered (value ordering).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Optimize {
+    /// Random order, scores ignored.
+    None,
+    /// Score band, then static letter frequency at the crossings.
+    Weak,
+    /// Word score plus the scores of the crossing words it completes.
+    Strong,
+    /// Word score plus the best scores still reachable at its crossings
+    /// (with ±5% noise).
+    Max,
+    /// Least constraining: most options left at the tightest crossing.
+    Reliability,
+    /// Theme words first (see [`SolveConfig::theme`]), then as `Weak`.
+    Theme,
+}
+
+impl Optimize {
+    pub fn parse(s: &str) -> Option<Optimize> {
+        match s {
+            "none" => Some(Optimize::None),
+            "weak" => Some(Optimize::Weak),
+            "strong" => Some(Optimize::Strong),
+            "max" => Some(Optimize::Max),
+            "reliability" => Some(Optimize::Reliability),
+            "theme" => Some(Optimize::Theme),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Optimize::None => "none",
+            Optimize::Weak => "weak",
+            Optimize::Strong => "strong",
+            Optimize::Max => "max",
+            Optimize::Reliability => "reliability",
+            Optimize::Theme => "theme",
+        }
+    }
+}
+
+/// (length, word index) of each theme word found in `wl` (others skipped).
+pub fn theme_ids(wl: &Wordlist, words: &[String]) -> std::collections::HashSet<(usize, usize)> {
+    words
+        .iter()
+        .filter_map(|w| crate::clues::normalize_answer(w))
+        .filter_map(|a| {
+            let letters: Vec<u8> = a.bytes().map(|b| b - b'A').collect();
+            let len = letters.len();
+            if len >= wl.by_len.len() {
+                return None;
+            }
+            wl.len_data(len).index_of(&letters).map(|i| (len, i))
+        })
+        .collect()
+}
+
+/// Read a theme list (one word per line, `#` comments, blank lines
+/// ignored) and resolve it against `wl`: (theme ids, number of words listed).
+pub fn load_theme(
+    path: &str,
+    wl: &Wordlist,
+) -> std::io::Result<(std::collections::HashSet<(usize, usize)>, usize)> {
+    let words: Vec<String> = std::fs::read_to_string(path)?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    Ok((theme_ids(wl, &words), words.len()))
+}
+
+/// How close to the already-filled part the next entry must be (when any
+/// entry qualifies).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Linked {
+    /// No restriction.
+    Off,
+    /// Within 2 crossings of a filled entry.
+    Near,
+    /// Crossing a filled entry.
+    On,
+}
+
+impl Linked {
+    pub fn parse(s: &str) -> Option<Linked> {
+        match s {
+            "off" => Some(Linked::Off),
+            "near" => Some(Linked::Near),
+            "on" => Some(Linked::On),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Linked::Off => "off",
+            Linked::Near => "near",
+            Linked::On => "on",
+        }
+    }
+}
+
 /// Which entry to fill next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotOrder {
@@ -77,14 +241,37 @@ pub struct SolveConfig {
     pub backjump: bool,
     /// Entry-selection heuristic (see [`SlotOrder`]).
     pub slot_order: SlotOrder,
-    /// Prefer entries crossing the already-filled part of the grid.
-    pub linked: bool,
+    /// Restrict the next entry to the neighbourhood of the filled part.
+    pub linked: Linked,
     /// Value ordering: rescore the first K candidates by the real number of
     /// options they leave each crossing entry (0 = static letter frequency).
     pub lookahead: usize,
     /// Forbid two different answers sharing a substring of this many
     /// letters (0 = off).
     pub avoid_substrings: usize,
+    /// Single attempt without node budget or candidate cap: fill the grid or
+    /// prove it unfillable.
+    pub exhaustive: bool,
+    /// Learn between restarts: a candidate whose failure involves no
+    /// earlier choice is impossible in any fill (at that quality floor) and
+    /// is dropped from later attempts.
+    pub learn: bool,
+    /// Value ordering (see [`Optimize`]).
+    pub optimize: Optimize,
+    /// How [`solve_portfolio`] uses several threads (see [`Parallel`]).
+    pub parallel: Parallel,
+    /// Run the search at low thread priority (background, power saving).
+    pub eco: bool,
+    /// Pangram: every letter of `pangram_alphabet` at least this many times
+    /// in the grid (0 = off). Turns backjumping and learning off: the
+    /// constraint is global and their conflict sets don't describe it.
+    pub pangram: u8,
+    pub pangram_alphabet: String,
+    /// Rebus strings the solver may place in any cell (they must be in the
+    /// word list's rebus table).
+    pub free_rebus: Vec<String>,
+    /// Theme words as (length, word index), used by `Optimize::Theme`.
+    pub theme: std::sync::Arc<std::collections::HashSet<(usize, usize)>>,
     /// Cooperative cancellation: when set, the search stops at the next
     /// check (used by [`solve_portfolio`] to stop the losing workers).
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -97,6 +284,10 @@ pub struct SolveConfig {
     pub max_budget: u64,
     /// Max candidates materialized per node (cap for band-shuffle cost).
     pub cand_cap: usize,
+    /// Candidates come in batches of min(cand_cap, max(MIN_BATCH, N /
+    /// cand_ratio)), N = words of the entry's length; the next batch loads
+    /// when one is exhausted, so no candidate is ever cut.
+    pub cand_ratio: usize,
     /// Return the first solution found (skip best-of optimization).
     pub stop_on_first: bool,
     /// A fill whose every searched entry scores >= this is "clean"; the best
@@ -118,6 +309,12 @@ pub struct SolveConfig {
     pub weak_bar: u8,
 }
 
+/// Smallest candidate batch (see [`SolveConfig::cand_ratio`]).
+pub const MIN_BATCH: usize = 20;
+
+/// Command-line switches (no value) handled by [`SolveConfig::with_args`].
+pub const SOLVER_SWITCHES: &[&str] = &["--exhaustive", "--eco"];
+
 /// Command-line options handled by [`SolveConfig::with_args`] (each takes a
 /// value).
 pub const SOLVER_FLAGS: &[&str] = &[
@@ -128,12 +325,19 @@ pub const SOLVER_FLAGS: &[&str] = &[
     "--lookahead",
     "--avoid-substrings",
     "--repair-max-weak",
+    "--max-cands",
+    "--cand-ratio",
+    "--learn",
+    "--optimize",
+    "--parallel",
+    "--pangram",
+    "--pangram-alphabet",
 ];
 
 impl SolveConfig {
     /// Apply the solver-variant options found in command-line `args`
     /// (`--propagation forward|arc`, `--backjump on|off`,
-    /// `--slot-order mrv|per-cell`, `--linked on|off`, `--lookahead K`,
+    /// `--slot-order mrv|per-cell`, `--linked off|near|on`, `--lookahead K`,
     /// `--avoid-substrings K`, `--repair-max-weak N`); other arguments are
     /// ignored.
     pub fn with_args(mut self, args: &[String]) -> Result<SolveConfig, String> {
@@ -145,6 +349,8 @@ impl SolveConfig {
                     .ok_or(format!("{} needs a value", args[i]))
             };
             match args[i].as_str() {
+                "--exhaustive" => self.exhaustive = true,
+                "--eco" => self.eco = true,
                 "--propagation" => {
                     let v = value()?;
                     self.propagation = Propagation::parse(v)
@@ -158,11 +364,9 @@ impl SolveConfig {
                     i += 1;
                 }
                 "--linked" => {
-                    self.linked = match value()? {
-                        "on" => true,
-                        "off" => false,
-                        v => return Err(format!("bad --linked '{v}' (use on or off)")),
-                    };
+                    let v = value()?;
+                    self.linked = Linked::parse(v)
+                        .ok_or(format!("bad --linked '{v}' (use off, near or on)"))?;
                     i += 1;
                 }
                 "--lookahead" => {
@@ -170,6 +374,24 @@ impl SolveConfig {
                     self.lookahead = v
                         .parse()
                         .map_err(|_| format!("bad --lookahead '{v}' (use a number, 0 = off)"))?;
+                    i += 1;
+                }
+                "--max-cands" => {
+                    let v = value()?;
+                    self.cand_cap = v
+                        .parse()
+                        .ok()
+                        .filter(|&n: &usize| n >= 1)
+                        .ok_or(format!("bad --max-cands '{v}' (use a number >= 1)"))?;
+                    i += 1;
+                }
+                "--cand-ratio" => {
+                    let v = value()?;
+                    self.cand_ratio = v
+                        .parse()
+                        .ok()
+                        .filter(|&n: &usize| n >= 1)
+                        .ok_or(format!("bad --cand-ratio '{v}' (use a number >= 1)"))?;
                     i += 1;
                 }
                 "--repair-max-weak" => {
@@ -184,6 +406,38 @@ impl SolveConfig {
                     self.avoid_substrings = v.parse().map_err(|_| {
                         format!("bad --avoid-substrings '{v}' (use a length, 0 = off)")
                     })?;
+                    i += 1;
+                }
+                "--pangram" => {
+                    let v = value()?;
+                    self.pangram = v
+                        .parse()
+                        .map_err(|_| format!("bad --pangram '{v}' (use a count, 0 = off)"))?;
+                    i += 1;
+                }
+                "--pangram-alphabet" => {
+                    self.pangram_alphabet = value()?.to_ascii_uppercase();
+                    i += 1;
+                }
+                "--optimize" => {
+                    let v = value()?;
+                    self.optimize = Optimize::parse(v).ok_or(format!(
+                        "bad --optimize '{v}' (use none, weak, strong, max, reliability or theme)"
+                    ))?;
+                    i += 1;
+                }
+                "--parallel" => {
+                    let v = value()?;
+                    self.parallel = Parallel::parse(v)
+                        .ok_or(format!("bad --parallel '{v}' (use portfolio or split)"))?;
+                    i += 1;
+                }
+                "--learn" => {
+                    self.learn = match value()? {
+                        "on" => true,
+                        "off" => false,
+                        v => return Err(format!("bad --learn '{v}' (use on or off)")),
+                    };
                     i += 1;
                 }
                 "--backjump" => {
@@ -214,13 +468,24 @@ impl SolveConfig {
         };
         format!(
             "propagation {p}, backjump {}, slot-order {so}, linked {}, lookahead {}, \
-                          avoid-substrings {}, repair-max-weak {}",
+                                       avoid-substrings {}, repair-max-weak {}, max-cands {}, cand-ratio {}",
             on(self.backjump),
-            on(self.linked),
+                        self.linked.name(),
             self.lookahead,
-            self.avoid_substrings,
-            self.repair_max_weak
-        )
+                        self.avoid_substrings,
+            self.repair_max_weak,
+                        self.cand_cap,
+            self.cand_ratio
+                ) + if self.learn { ", learn on" } else { ", learn off" }
+                        + ", optimize "
+            + self.optimize.name()
+                        + if self.parallel == Parallel::Split { ", parallel split" } else { ", parallel portfolio" }
+                        + if self.eco { ", eco" } else { "" }
+            + &if self.pangram > 0 {
+                format!(", pangram {} ({})", self.pangram, self.pangram_alphabet)
+            } else {
+                String::new()
+            } + if self.exhaustive { ", exhaustive" } else { "" }
     }
 }
 
@@ -251,9 +516,15 @@ pub fn solve_portfolio(
     threads: usize,
 ) -> Result<SolveResult, String> {
     Solver::with_locks(p, wl, locks)?;
+    let split = if cfg.parallel == Parallel::Split && threads > 1 {
+        Some(split_first_entry(p, wl, locks, cfg, threads)?)
+    } else {
+        None
+    };
     if threads <= 1 {
         return Ok(Solver::with_locks(p, wl, locks)?.solve(cfg));
     }
+    let split = &split;
     let flag = cfg
         .cancel
         .clone()
@@ -268,10 +539,17 @@ pub fn solve_portfolio(
                 cfg_k.cancel = Some(flag.clone());
                 let flag = flag.clone();
                 s.spawn(move || {
-                    let r = Solver::with_locks(p, wl, locks)
-                        .expect("locks validated")
-                        .solve(&cfg_k);
-                    if cfg_k.stop_on_first && r.reason == "solved" {
+                    let mut solver = Solver::with_locks(p, wl, locks).expect("locks validated");
+                    if let Some((ei, parts)) = split {
+                        solver.base_domains[*ei].and_assign(&parts[k]);
+                    }
+                    let r = solver.solve(&cfg_k);
+                    // a first fill (when that's all we want) makes the other
+                    // workers pointless; so does a proof — unless each worker
+                    // only searched its own part
+                    if (cfg_k.stop_on_first && r.reason == "solved")
+                        || (r.proven_unfillable && split.is_none())
+                    {
                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     r
@@ -283,6 +561,25 @@ pub fn solve_portfolio(
             .map(|h| h.join().expect("worker"))
             .collect()
     });
+    Ok(if split.is_some() {
+        merge_split_results(results)
+    } else {
+        merge_results(results)
+    })
+}
+
+/// Merge for split mode: the grid is unfillable only if every part is.
+fn merge_split_results(results: Vec<SolveResult>) -> SolveResult {
+    let all = results.iter().all(|r| r.proven_unfillable);
+    let mut r = merge_results(results);
+    r.proven_unfillable = all && r.reason != "solved";
+    r
+}
+
+/// Combine worker results: best fill by mean, best clean alternative from any
+/// worker, summed node/restart counts, proof of unfillability from any.
+fn merge_results(results: Vec<SolveResult>) -> SolveResult {
+    let proven = results.iter().any(|r| r.proven_unfillable);
     let mut total_nodes = 0u64;
     let mut total_restarts = 0u64;
     let mut best: Option<SolveResult> = None;
@@ -310,11 +607,32 @@ pub fn solve_portfolio(
             best = Some(res);
         }
     }
-    let mut r = best.expect("at least two workers");
+    let mut r = best.expect("at least one worker");
     r.nodes = total_nodes;
     r.restarts = total_restarts;
     r.clean = best_clean;
-    Ok(r)
+    r.proven_unfillable = proven && r.reason != "solved";
+    r
+}
+
+/// One candidate word for an entry, as shown by guided selection.
+#[derive(Clone, Debug)]
+pub struct Suggestion {
+    pub word: String,
+    /// Word score plus the scores of the crossing words it completes.
+    pub score: u32,
+    /// Best scores still reachable at its crossings, plus an ease bonus
+    /// (log of the options left at the tightest crossing).
+    pub fill_score: f64,
+    /// With a check: Some(true) the rest of the grid still fills,
+    /// Some(false) proven not to, None unknown (time ran out / not checked).
+    pub fillable: Option<bool>,
+}
+
+pub struct Suggestions {
+    pub candidates: Vec<Suggestion>,
+    /// Entries left with a single possible word: (entry, word).
+    pub forced: Vec<(usize, String)>,
 }
 
 /// Fraction of `time_limit_s` granted to the post-solve repair pass. Region
@@ -330,9 +648,18 @@ impl Default for SolveConfig {
             // benchmark (first fill, 5 s): on 25/30 vs off 23/30
             backjump: true,
             slot_order: SlotOrder::Mrv,
-            linked: false,
+            linked: Linked::Off,
             lookahead: 0,
             avoid_substrings: 0,
+            exhaustive: false,
+            learn: false,
+            optimize: Optimize::Weak,
+            parallel: Parallel::Portfolio,
+            eco: false,
+            pangram: 0,
+            pangram_alphabet: "ABCDEFGHILMNOPQRSTUVZ".into(),
+            free_rebus: Vec::new(),
+            theme: Default::default(),
             cancel: None,
             time_limit_s: 30.0,
             // Clue-count scores: 1 clue → 50, 2 → 58, 3 → 63. Secure any fill
@@ -342,6 +669,7 @@ impl Default for SolveConfig {
             initial_budget: 2_000,
             max_budget: 400_000,
             cand_cap: 400,
+            cand_ratio: 1,
             stop_on_first: false,
             clean_floor: 50,
             repair_max_weak: 4,
@@ -364,6 +692,7 @@ pub struct SolvedFill {
     pub fill: Vec<(usize, String, u8)>,
 }
 
+#[derive(Clone)]
 pub struct SolveResult {
     pub letters: Option<Vec<Option<u8>>>,
     pub nodes: u64,
@@ -381,6 +710,9 @@ pub struct SolveResult {
     /// Callers should prefer it whenever it passes their keep gates on its
     /// own — same yield, strictly fewer weak entries.
     pub clean: Option<SolvedFill>,
+    /// The search explored everything and found no fill: the grid is
+    /// unfillable with this word list (at the lowest quality floor).
+    pub proven_unfillable: bool,
 }
 
 /// A domain snapshot taken before an entry's domain is changed.
@@ -436,13 +768,22 @@ pub struct Solver<'a> {
     deadline: Instant,
     floor: u8,
     cand_cap: usize,
+    cand_ratio: usize,
     rng: Rng,
     propagation: Propagation,
     backjump: bool,
     slot_order: SlotOrder,
-    linked: bool,
+    linked: Linked,
     lookahead: usize,
     avoid_substrings: usize,
+    learn: bool,
+    optimize: Optimize,
+    /// pangram: minimum count per letter (0 = off) and the letters (bit c)
+    pangram: u8,
+    pangram_mask: u32,
+    theme: std::sync::Arc<std::collections::HashSet<(usize, usize)>>,
+    /// learned nogoods: (entry, word, floor at which it was proven)
+    learned: Vec<(usize, usize, u8)>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// k-grams (k = avoid_substrings) of the placed answers → depths of the
     /// entries holding them (`STATIC` for locked answers)
@@ -456,13 +797,13 @@ pub struct Solver<'a> {
     culprits: Vec<Bitset>,
     /// conflict set of the last failure (depths involved)
     conflict: Bitset,
+    /// rebus symbols (bit = symbol) the solver may place in any cell
+    free_rebus: u32,
     /// per entry, per position: letters still possible (bit c = letter c)
     masks: Vec<Vec<u32>>,
     /// per entry: in-tier candidates with letter c at position p, at
-    /// index p * 26 + c (keeps `masks` up to date incrementally)
+    /// index p * ALPHA + c (keeps `masks` up to date incrementally)
     support: Vec<Vec<u32>>,
-    /// did the current attempt cut any candidate list (cand_cap)?
-    truncated: bool,
 }
 
 impl<'a> Solver<'a> {
@@ -579,7 +920,8 @@ impl<'a> Solver<'a> {
             attempt_budget: u64::MAX,
             deadline: Instant::now(),
             floor: 0,
-            cand_cap: 256,
+            cand_cap: defaults.cand_cap,
+            cand_ratio: defaults.cand_ratio,
             rng: Rng::new(0),
             propagation: defaults.propagation,
             backjump: defaults.backjump,
@@ -587,25 +929,209 @@ impl<'a> Solver<'a> {
             linked: defaults.linked,
             lookahead: defaults.lookahead,
             avoid_substrings: defaults.avoid_substrings,
+            learn: defaults.learn,
+            optimize: defaults.optimize,
+            pangram: 0,
+            pangram_mask: 0,
+            theme: defaults.theme.clone(),
+            learned: Vec::new(),
             cancel: None,
             grams: std::collections::HashMap::new(),
             gram_conflict: Bitset::zeros(n.max(1)),
             saved_in: vec![0; n],
             serial: 0,
             culprits: vec![Bitset::zeros(n.max(1)); n],
+            free_rebus: 0,
             conflict: Bitset::zeros(n.max(1)),
             masks: p.entries.iter().map(|e| vec![0u32; e.len]).collect(),
-            support: p.entries.iter().map(|e| vec![0u32; e.len * 26]).collect(),
-            truncated: false,
+            support: p
+                .entries
+                .iter()
+                .map(|e| vec![0u32; e.len * ALPHA])
+                .collect(),
         };
         s.compute_base();
         Ok(s)
+    }
+
+    /// Letter counts (bit-indexed by letter) over the filled cells.
+    fn letter_counts(&self) -> [u32; 26] {
+        let mut counts = [0u32; 26];
+        for &l in self.cell_letter.iter().flatten() {
+            if (l as usize) < 26 {
+                counts[l as usize] += 1;
+            }
+        }
+        counts
+    }
+
+    /// Can the pangram still be completed? Not if the missing letter
+    /// occurrences outnumber the empty cells, or a missing letter fits in
+    /// no empty cell any more.
+    fn pangram_possible(&self) -> bool {
+        let counts = self.letter_counts();
+        let k = self.pangram as u32;
+        let missing: Vec<usize> = (0..26)
+            .filter(|&c| self.pangram_mask & (1 << c) != 0 && counts[c] < k)
+            .collect();
+        if missing.is_empty() {
+            return true;
+        }
+        let empty: Vec<usize> = (0..self.p.n_cells)
+            .filter(|&c| self.cell_letter[c].is_none())
+            .collect();
+        let need: u32 = missing.iter().map(|&c| k - counts[c]).sum();
+        if need as usize > empty.len() {
+            return false;
+        }
+        // letters still possible in each empty cell
+        let mut reachable = 0u32;
+        for &cid in &empty {
+            let mut m = u32::MAX;
+            for &(e, pos) in &self.p.cell_entries[cid] {
+                if self.assigned[e].is_none() && !self.is_locked[e] {
+                    m &= self.masks[e][pos];
+                }
+            }
+            reachable |= m;
+        }
+        missing.iter().all(|&c| reachable & (1 << c) != 0)
     }
 
     fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
             .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Guided selection for entry `ei`: its candidates (at most `limit`)
+    /// ranked by score then fill score, and the forced words of the grid.
+    /// With `check_s > 0` each listed candidate is placed and the rest of
+    /// the grid filled within its share of that time.
+    pub fn suggest(&mut self, ei: usize, limit: usize, check_s: f64) -> Suggestions {
+        self.propagation = Propagation::Arc;
+        self.reset(0);
+        if !self.propagate_all() {
+            return Suggestions {
+                candidates: Vec::new(),
+                forced: Vec::new(),
+            };
+        }
+        let open = |s: &Self, e: usize| s.assigned[e].is_none() && !s.is_locked[e];
+        let first_word = |s: &Self, e: usize| {
+            s.domains[e]
+                .iter_ones()
+                .next()
+                .filter(|&w| w < s.cutoff_by_entry[e])
+        };
+        let forced: Vec<(usize, String)> = (0..self.p.entries.len())
+            .filter(|&e| open(self, e) && self.dom_count[e] == 1)
+            .filter_map(|e| {
+                first_word(self, e).map(|w| (e, self.wl.word(self.p.entries[e].len, w)))
+            })
+            .collect();
+        let len = self.p.entries[ei].len;
+        let ld = self.wl.len_data(len);
+        let mut out: Vec<Suggestion> = Vec::new();
+        for w in self.domains[ei].iter_ones() {
+            if w >= self.cutoff_by_entry[ei] {
+                break;
+            }
+            let letters = &ld.letters[w];
+            let (mut completed, mut reach, mut least, mut dead) = (0u32, 0f64, u32::MAX, false);
+            for &(pos, nbr, npos) in &self.crossings[ei] {
+                if !open(self, nbr) {
+                    continue;
+                }
+                let nld = self.wl.len_data(self.p.entries[nbr].len);
+                let compat = nld.compat(npos, letters[pos]);
+                let cutoff = self.cutoff_by_entry[nbr];
+                let Some(best) = self.domains[nbr].first_and_below(compat, cutoff) else {
+                    dead = true;
+                    break;
+                };
+                let best = nld.scores[best] as u32;
+                let count = self.domains[nbr].count_and_below(compat, cutoff);
+                let is_completed = self.p.entries[nbr]
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .all(|(k, &c)| k == npos || self.cell_letter[c].is_some());
+                if is_completed {
+                    completed += best;
+                }
+                reach += best as f64;
+                least = least.min(count);
+            }
+            if dead {
+                continue;
+            }
+            let ease = if least == u32::MAX {
+                0.0
+            } else {
+                10.0 * (1.0 + least as f64).log10()
+            };
+            out.push(Suggestion {
+                word: self.wl.word(len, w),
+                score: ld.scores[w] as u32 + completed,
+                fill_score: reach + ease,
+                fillable: None,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.score.cmp(&a.score).then(
+                b.fill_score
+                    .partial_cmp(&a.fill_score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        out.truncate(limit);
+        if check_s > 0.0 && !out.is_empty() {
+            let e = &self.p.entries[ei];
+            let base: Vec<Lock> = self
+                .locked_out
+                .iter()
+                .map(|(le, answer, _)| {
+                    let en = &self.p.entries[*le];
+                    Lock {
+                        row: en.row,
+                        col: en.col,
+                        dir: en.dir,
+                        answer: answer.clone(),
+                    }
+                })
+                .collect();
+            let share = check_s / out.len() as f64;
+            for sug in out.iter_mut() {
+                let mut locks = base.clone();
+                locks.push(Lock {
+                    row: e.row,
+                    col: e.col,
+                    dir: e.dir,
+                    answer: sug.word.clone(),
+                });
+                let Ok(mut inner) = Solver::with_locks(self.p, self.wl, &locks) else {
+                    continue; // e.g. a rebus word: no check
+                };
+                let r = inner.solve(&SolveConfig {
+                    time_limit_s: share.max(0.05),
+                    stop_on_first: true,
+                    tiers: vec![0],
+                    ..Default::default()
+                });
+                sug.fillable = if r.reason == "solved" {
+                    Some(true)
+                } else if r.proven_unfillable {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+        }
+        Suggestions {
+            candidates: out,
+            forced,
+        }
     }
 
     /// Analyze the grid without searching: entries with no candidate,
@@ -625,7 +1151,7 @@ impl<'a> Solver<'a> {
                 .filter(|&e| searchable(self, e) && self.dom_count[e] == 0)
                 .collect();
         }
-        let all = (1u32 << 26) - 1;
+        let all = u32::MAX;
         let mut cell_letters = vec![all; self.p.n_cells];
         let mut forced = Vec::new();
         for (cid, mask) in cell_letters.iter_mut().enumerate() {
@@ -638,7 +1164,7 @@ impl<'a> Solver<'a> {
                     *mask &= self.masks[e][pos];
                 }
             }
-            if mask.count_ones() == 1 {
+            if mask.count_ones() == 1 && mask.trailing_zeros() < 26 {
                 let (r, c) = self.p.cell_rc[cid];
                 forced.push((r, c, b'A' + mask.trailing_zeros() as u8));
             }
@@ -655,6 +1181,7 @@ impl<'a> Solver<'a> {
     /// Constrain every entry's domain by the combined prefill (template + locks)
     /// and snapshot as the per-attempt base.
     fn compute_base(&mut self) {
+        let n_rebus = self.wl.rebus.len() as u8;
         for ei in 0..self.p.entries.len() {
             let e = &self.p.entries[ei];
             let ld = self.wl.len_data(e.len);
@@ -662,20 +1189,66 @@ impl<'a> Solver<'a> {
                 if let Some(c) = self.base_cell_letter[cid] {
                     let mask = ld.compat(pos, c).clone();
                     self.domains[ei].and_assign(&mask);
+                } else {
+                    // rebus symbols only where the template puts them,
+                    // unless the string is free
+                    for sym in REBUS_BASE..REBUS_BASE + n_rebus {
+                        if self.free_rebus & (1 << sym) == 0 {
+                            let mask = ld.compat(pos, sym).clone();
+                            self.domains[ei].andnot_assign(&mask);
+                        }
+                    }
                 }
             }
         }
         self.base_domains = self.domains.clone();
     }
 
+    /// Let the solver place these rebus strings (present in the word list's
+    /// rebus table) in any cell, not only where the template puts them.
+    pub fn allow_free_rebus(&mut self, strings: &[String]) {
+        for (k, r) in self.wl.rebus.iter().enumerate() {
+            if strings.iter().any(|s| s.eq_ignore_ascii_case(r)) {
+                self.free_rebus |= 1 << (REBUS_BASE as usize + k);
+            }
+        }
+        for (ei, e) in self.p.entries.iter().enumerate() {
+            self.domains[ei] = match self.wl.len_data(e.len).n {
+                0 => Bitset::zeros(1),
+                n => Bitset::ones(n),
+            };
+        }
+        self.compute_base();
+    }
+
     pub fn solve(&mut self, cfg: &SolveConfig) -> SolveResult {
+        if cfg.eco {
+            crate::util::lower_thread_priority();
+        }
+        if !cfg.free_rebus.is_empty() {
+            self.allow_free_rebus(&cfg.free_rebus);
+        }
         self.cand_cap = cfg.cand_cap;
+        self.cand_ratio = cfg.cand_ratio.max(1);
         self.propagation = cfg.propagation;
         self.backjump = cfg.backjump;
         self.slot_order = cfg.slot_order;
         self.linked = cfg.linked;
         self.lookahead = cfg.lookahead;
         self.avoid_substrings = cfg.avoid_substrings;
+        self.learn = cfg.learn;
+        self.optimize = cfg.optimize;
+        self.theme = cfg.theme.clone();
+        self.pangram = cfg.pangram;
+        self.pangram_mask = cfg
+            .pangram_alphabet
+            .bytes()
+            .filter(u8::is_ascii_uppercase)
+            .fold(0, |m, b| m | 1 << (b - b'A'));
+        if self.pangram > 0 {
+            self.backjump = false;
+            self.learn = false;
+        }
         self.cancel = cfg.cancel.clone();
         self.rng = Rng::new(cfg.seed);
         let t0 = Instant::now();
@@ -709,6 +1282,13 @@ impl<'a> Solver<'a> {
             self.reset(lowest);
             infeasible = !self.propagate_all();
         }
+        if !infeasible && self.pangram > 0 {
+            self.reset(lowest);
+            if self.propagation == Propagation::Arc {
+                self.propagate_all();
+            }
+            infeasible = !self.pangram_possible();
+        }
         if infeasible {
             return SolveResult {
                 letters: None,
@@ -721,12 +1301,28 @@ impl<'a> Solver<'a> {
                 weak_count: None,
                 fill: None,
                 clean: None,
+                proven_unfillable: true,
             };
+        }
+
+        // Exhaustive: one attempt, no node budget, no candidate cap — it
+        // either fills the grid or proves it unfillable (time permitting).
+        let mut proven = false;
+        if cfg.exhaustive {
+            restarts += 1;
+            let seed = self.rng.next_u64();
+            let outcome = self.attempt(lowest, u64::MAX, seed, global_deadline);
+            total_nodes += self.nodes;
+            match outcome {
+                Outcome::Solved => self.consider(&mut best, &mut clean, cfg),
+                Outcome::Exhausted => proven = true,
+                _ => {}
+            }
         }
 
         // Phase 1 — feasibility: restart at the lowest floor until first solve.
         let mut budget = cfg.initial_budget;
-        while Instant::now() < global_deadline && best.is_none() && !self.cancelled() {
+        while !proven && Instant::now() < global_deadline && best.is_none() && !self.cancelled() {
             restarts += 1;
             let seed = self.rng.next_u64();
             let outcome = self.attempt(lowest, budget, seed, global_deadline);
@@ -734,8 +1330,9 @@ impl<'a> Solver<'a> {
             if outcome == Outcome::Solved {
                 self.consider(&mut best, &mut clean, cfg);
             }
-            if outcome == Outcome::Exhausted && !self.truncated {
-                break; // the whole tree was explored: proven unfillable
+            if outcome == Outcome::Exhausted {
+                proven = true; // the whole tree was explored: unfillable
+                break;
             }
             budget = (budget * 2).min(cfg.max_budget);
         }
@@ -770,7 +1367,7 @@ impl<'a> Solver<'a> {
                             self.consider(&mut best, &mut clean, cfg);
                             break 'hunt;
                         }
-                        if outcome == Outcome::Exhausted && !self.truncated {
+                        if outcome == Outcome::Exhausted {
                             break; // this floor is proven infeasible
                         }
                         budget = (budget * 2).min(cfg.max_budget);
@@ -838,6 +1435,7 @@ impl<'a> Solver<'a> {
                     weak_count: Some(weak_count),
                     fill: Some(fill),
                     clean,
+                    proven_unfillable: false,
                 }
             }
             None => SolveResult {
@@ -851,6 +1449,7 @@ impl<'a> Solver<'a> {
                 weak_count: None,
                 fill: None,
                 clean: None,
+                proven_unfillable: proven,
             },
         }
     }
@@ -902,7 +1501,7 @@ impl<'a> Solver<'a> {
             if weak_bar > 0 && sc < weak_bar {
                 weak += 1;
             }
-            fill.push((ei, ld.word_string(w), sc));
+            fill.push((ei, self.wl.word(self.p.entries[ei].len, w), sc));
         }
         // Append locked theme answers to the fill list (for clue output).
         for (ei, answer, score) in &self.locked_out {
@@ -1076,6 +1675,7 @@ impl<'a> Solver<'a> {
             initial_budget: cfg.initial_budget,
             max_budget: cfg.max_budget,
             cand_cap: cfg.cand_cap,
+            cand_ratio: cfg.cand_ratio,
             stop_on_first: true, // any region solve is clean by construction
             clean_floor: cfg.clean_floor,
             repair_max_weak: 0, // no recursive repair
@@ -1086,6 +1686,15 @@ impl<'a> Solver<'a> {
             linked: cfg.linked,
             lookahead: cfg.lookahead,
             avoid_substrings: cfg.avoid_substrings,
+            exhaustive: false,
+            learn: false,
+            optimize: cfg.optimize,
+            parallel: Parallel::Portfolio,
+            eco: cfg.eco,
+            pangram: 0,
+            pangram_alphabet: cfg.pangram_alphabet.clone(),
+            free_rebus: cfg.free_rebus.clone(),
+            theme: cfg.theme.clone(),
             cancel: cfg.cancel.clone(),
         });
         let letters = r.letters?;
@@ -1134,6 +1743,111 @@ impl<'a> Solver<'a> {
         })
     }
 
+    /// The `n` best fills by total (= mean) score, best first, by branch and
+    /// bound: a branch is cut when even the best word still available in
+    /// every open entry couldn't beat the n-th best fill found. The bool is
+    /// true when the search completed (the list is then provably the top n).
+    /// Uses the lowest of `cfg.tiers` and `cfg.time_limit_s`.
+    pub fn best_fills(&mut self, cfg: &SolveConfig, n: usize) -> (Vec<SolvedFill>, bool) {
+        self.propagation = cfg.propagation;
+        self.backjump = false; // bound cuts are not constraint conflicts
+        self.learn = false;
+        self.cand_cap = cfg.cand_cap;
+        self.cand_ratio = cfg.cand_ratio.max(1);
+        self.optimize = Optimize::Weak; // best scores first: tight bounds early
+        self.cancel = cfg.cancel.clone();
+        self.avoid_substrings = cfg.avoid_substrings;
+        let floor = cfg.tiers.iter().copied().min().unwrap_or(0);
+        self.floor = floor;
+        self.nodes = 0;
+        self.attempt_budget = u64::MAX;
+        self.deadline = Instant::now() + std::time::Duration::from_secs_f64(cfg.time_limit_s);
+        self.rng = Rng::new(cfg.seed);
+        let unfillable_base = (0..self.p.entries.len())
+            .any(|ei| !self.is_locked[ei] && self.base_domains[ei].count_ones() == 0);
+        if unfillable_base || n == 0 {
+            return (Vec::new(), true);
+        }
+        self.reset(floor);
+        if self.propagation == Propagation::Arc && !self.propagate_all() {
+            return (Vec::new(), true);
+        }
+        let mut top: Vec<(u32, SolvedFill)> = Vec::new();
+        let done = self.branch_and_bound(n, &mut top, cfg.weak_bar) != Outcome::TimeLimit;
+        (top.into_iter().map(|(_, f)| f).collect(), done)
+    }
+
+    /// Total score of the assigned entries plus the best in-tier score still
+    /// available in each open one; None if some open entry has no candidate.
+    fn score_upper_bound(&self) -> Option<u32> {
+        let mut total = 0u32;
+        for ei in 0..self.p.entries.len() {
+            if self.is_locked[ei] {
+                continue;
+            }
+            let ld = self.wl.len_data(self.p.entries[ei].len);
+            let w = match self.assigned[ei] {
+                Some(w) => w,
+                None => self.domains[ei]
+                    .iter_ones()
+                    .next()
+                    .filter(|&w| w < self.cutoff_by_entry[ei])?,
+            };
+            total += ld.scores[w] as u32;
+        }
+        Some(total)
+    }
+
+    fn branch_and_bound(
+        &mut self,
+        n: usize,
+        top: &mut Vec<(u32, SolvedFill)>,
+        weak_bar: u8,
+    ) -> Outcome {
+        if self.n_assigned == self.n_searchable {
+            let f = self.snapshot_solution(weak_bar);
+            let total = self.score_upper_bound().unwrap_or(0);
+            let at = top
+                .iter()
+                .position(|(t, _)| *t < total)
+                .unwrap_or(top.len());
+            top.insert(at, (total, f));
+            top.truncate(n);
+            return Outcome::Exhausted;
+        }
+        self.nodes += 1;
+        if self.nodes & 15 == 0 && (Instant::now() >= self.deadline || self.cancelled()) {
+            return Outcome::TimeLimit;
+        }
+        match self.score_upper_bound() {
+            None => return Outcome::Exhausted,
+            Some(ub) if top.len() == n && ub <= top[n - 1].0 => return Outcome::Exhausted,
+            _ => {}
+        }
+        let Some(ei) = self.select_entry() else {
+            return Outcome::Exhausted;
+        };
+        let mut from = 0usize;
+        loop {
+            let (candidates, next) = self.ordered_candidates_from(ei, from);
+            for w in candidates {
+                let mut frame = self.assign(ei, w);
+                let alive = !self.frame_dead(&frame)
+                    && (self.propagation == Propagation::Forward || self.propagate(&mut frame));
+                if alive && self.branch_and_bound(n, top, weak_bar) == Outcome::TimeLimit {
+                    self.undo(frame);
+                    return Outcome::TimeLimit;
+                }
+                self.undo(frame);
+            }
+            match next {
+                Some(k) => from = k,
+                None => break,
+            }
+        }
+        Outcome::Exhausted
+    }
+
     /// One bounded attempt at a given quality floor. Resets state first.
     fn attempt(&mut self, floor: u8, budget: u64, seed: u64, deadline: Instant) -> Outcome {
         self.floor = floor;
@@ -1141,9 +1855,12 @@ impl<'a> Solver<'a> {
         self.deadline = deadline;
         self.nodes = 0;
         self.rng = Rng::new(seed);
-        self.truncated = false;
+
         self.reset(floor);
         if self.propagation == Propagation::Arc && !self.propagate_all() {
+            return Outcome::Exhausted;
+        }
+        if self.pangram > 0 && !self.pangram_possible() {
             return Outcome::Exhausted;
         }
         self.recurse()
@@ -1184,6 +1901,12 @@ impl<'a> Solver<'a> {
                     }
                 }
             }
+            // nogoods learned at this floor or a lower one hold here too
+            for &(e, w, f) in &self.learned {
+                if e == ei && f <= floor {
+                    self.domains[ei].clear(w);
+                }
+            }
             let cutoff = self.wl.len_data(len).tier_cutoff(floor);
             self.cutoff_by_entry[ei] = cutoff;
             self.rebuild(ei);
@@ -1209,6 +1932,10 @@ impl<'a> Solver<'a> {
 
     fn recurse(&mut self) -> Outcome {
         if self.n_assigned == self.n_searchable {
+            if self.pangram > 0 && !self.pangram_possible() {
+                self.conflict_all_below(self.n_assigned);
+                return Outcome::Exhausted; // full grid without every letter
+            }
             return Outcome::Solved;
         }
         self.nodes += 1;
@@ -1225,44 +1952,54 @@ impl<'a> Solver<'a> {
             return Outcome::Exhausted;
         };
 
-        let candidates = self.ordered_candidates(ei);
-        // With the candidate cap hit, failure doesn't prove the domain empty.
-        let truncated =
-            candidates.len() >= self.cand_cap && (self.dom_count[ei] as usize) > candidates.len();
-        self.truncated |= truncated;
         let mut conf = self.culprits[ei].clone();
-        // candidates rejected for repeated substrings depend on the entries
-        // holding those substrings
-        conf.or_assign(&self.gram_conflict);
+        let mut from = 0usize;
+        loop {
+            let (candidates, next) = self.ordered_candidates_from(ei, from);
+            // candidates rejected for repeated substrings depend on the entries
+            // holding those substrings
+            conf.or_assign(&self.gram_conflict);
 
-        for w in candidates {
-            let mut frame = self.assign(ei, w);
-            let alive = !self.frame_dead(&frame)
-                && (self.propagation == Propagation::Forward || self.propagate(&mut frame));
-            if alive {
-                match self.recurse() {
-                    Outcome::Solved => return Outcome::Solved,
-                    r @ (Outcome::Budget | Outcome::TimeLimit) => {
-                        self.undo(frame);
-                        return r;
-                    }
-                    Outcome::Exhausted => {
-                        if self.backjump && !self.conflict.get(depth) {
-                            // The failure below doesn't involve this choice:
-                            // no other candidate here can fix it — jump.
+            for w in candidates {
+                let mut frame = self.assign(ei, w);
+                let alive = !self.frame_dead(&frame)
+                    && (self.propagation == Propagation::Forward || self.propagate(&mut frame))
+                    && (self.pangram == 0 || self.pangram_possible());
+                if alive {
+                    match self.recurse() {
+                        Outcome::Solved => return Outcome::Solved,
+                        r @ (Outcome::Budget | Outcome::TimeLimit) => {
                             self.undo(frame);
-                            return Outcome::Exhausted;
+                            return r;
+                        }
+                        Outcome::Exhausted => {
+                            if self.backjump && !self.conflict.get(depth) {
+                                // The failure below doesn't involve this choice:
+                                // no other candidate here can fix it — jump.
+                                self.undo(frame);
+                                return Outcome::Exhausted;
+                            }
                         }
                     }
                 }
+                if self.learn {
+                    // this candidate's failure owes nothing to earlier
+                    // choices: it is impossible in any fill at this floor
+                    let mut own = self.conflict.clone();
+                    own.clear(depth);
+                    if own.count_ones() == 0 && !self.learned.contains(&(ei, w, self.floor)) {
+                        self.learned.push((ei, w, self.floor));
+                    }
+                }
+                conf.or_assign(&self.conflict);
+                self.undo(frame);
             }
-            conf.or_assign(&self.conflict);
-            self.undo(frame);
+            match next {
+                Some(n) => from = n, // load the next batch
+                None => break,
+            }
         }
         conf.clear(depth);
-        if truncated {
-            conf.or_assign(&Self::all_below(conf.nbits(), depth));
-        }
         self.conflict = conf;
         Outcome::Exhausted
     }
@@ -1282,19 +2019,43 @@ impl<'a> Solver<'a> {
     fn select_entry(&self) -> Option<usize> {
         let open = |ei: usize| self.assigned[ei].is_none() && !self.is_locked[ei];
         let filled = |ei: usize| self.assigned[ei].is_some() || self.is_locked[ei];
-        // "linked": restrict to entries crossing the filled part, if any do.
-        let only_linked = self.linked
-            && (0..self.p.entries.len())
-                .any(|ei| open(ei) && self.crossings[ei].iter().any(|&(_, o, _)| filled(o)));
+        // distance (in crossings) from the filled part, for "linked"
+        let max_dist = match self.linked {
+            Linked::Off => usize::MAX,
+            Linked::Near => 2,
+            Linked::On => 1,
+        };
+        let n = self.p.entries.len();
+        let mut dist = vec![usize::MAX; n];
+        if max_dist != usize::MAX {
+            let mut frontier: Vec<usize> = (0..n).filter(|&e| filled(e)).collect();
+            for &e in &frontier {
+                dist[e] = 0;
+            }
+            for d in 1..=max_dist {
+                let mut next = Vec::new();
+                for &e in &frontier {
+                    for &(_, o, _) in &self.crossings[e] {
+                        if dist[o] == usize::MAX {
+                            dist[o] = d;
+                            next.push(o);
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
+        let only_linked =
+            max_dist != usize::MAX && (0..n).any(|ei| open(ei) && dist[ei] <= max_dist);
         let mut best = None;
         // key: candidates (per empty cell for PerCell, scaled to stay
         // integral), then longer entry first
         let mut best_key = (u64::MAX, 0usize);
-        for ei in 0..self.p.entries.len() {
+        for (ei, &d) in dist.iter().enumerate() {
             if !open(ei) {
                 continue;
             }
-            if only_linked && !self.crossings[ei].iter().any(|&(_, o, _)| filled(o)) {
+            if only_linked && d > max_dist {
                 continue;
             }
             let cnt = self.dom_count[ei] as u64;
@@ -1350,9 +2111,24 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Batch size for `ei`: min(cand_cap, max(MIN_BATCH, N / cand_ratio)).
+    fn batch_size(&self, ei: usize) -> usize {
+        let n = self.wl.len_data(self.p.entries[ei].len).n;
+        self.cand_cap.min(MIN_BATCH.max(n / self.cand_ratio.max(1)))
+    }
+
+    #[cfg(test)]
     fn ordered_candidates(&mut self, ei: usize) -> Vec<usize> {
+        self.ordered_candidates_from(ei, 0).0
+    }
+
+    /// The next batch of candidates for `ei` among its domain words with
+    /// index >= `from`, ordered; plus where the following batch starts.
+    fn ordered_candidates_from(&mut self, ei: usize, from: usize) -> (Vec<usize>, Option<usize>) {
         let len = self.p.entries[ei].len;
         let cutoff = self.cutoff_by_entry[ei];
+        let batch = self.batch_size(ei);
+        let mut next: Option<usize> = None;
 
         // Active crossings to unassigned neighbors: (pos_in_ei, nbr_len, nbr_pos)
         let mut cross: Vec<(usize, usize, usize)> = Vec::new();
@@ -1369,7 +2145,14 @@ impl<'a> Solver<'a> {
             let ld = self.wl.len_data(len);
             let used = &self.used[len];
             for w in self.domains[ei].iter_ones() {
+                if w < from {
+                    continue;
+                }
                 if w >= cutoff {
+                    break;
+                }
+                if cands.len() >= batch {
+                    next = Some(w);
                     break;
                 }
                 if used.get(w) {
@@ -1393,9 +2176,6 @@ impl<'a> Solver<'a> {
                     lcv = lcv.saturating_add(self.wl.len_data(nlen).pos_count(npos, letters[pos]));
                 }
                 cands.push((w, ld.scores[w], lcv));
-                if cands.len() >= self.cand_cap {
-                    break;
-                }
             }
         }
 
@@ -1407,22 +2187,113 @@ impl<'a> Solver<'a> {
             }
         }
 
-        // key = band * BIG + jittered lcv. band dominates → score order kept.
         let mut keyed: Vec<(usize, i64)> = cands
             .iter()
-            .map(|&(w, sc, lcv)| {
-                let band = (sc / 5) as i64;
-                let j = 850 + self.rng.below(301) as i64; // 0.85..1.15
-                let key = band * 1_000_000_000 + (lcv as i64 * j / 1000);
-                (w, key)
-            })
+            .map(|&(w, sc, lcv)| (w, self.order_key(ei, len, w, sc, lcv)))
             .collect();
+        if self.pangram > 0 {
+            // words bringing letters the pangram still lacks go first
+            let counts = self.letter_counts();
+            let k = self.pangram as u32;
+            let ld = self.wl.len_data(len);
+            for (w, key) in keyed.iter_mut() {
+                let gain = ld.letters[*w]
+                    .iter()
+                    .filter(|&&c| self.pangram_mask & (1 << c) != 0 && counts[c as usize] < k)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len() as i64;
+                *key = key.saturating_add(gain * 1_000_000_000_000);
+            }
+        }
         keyed.sort_by_key(|a| std::cmp::Reverse(a.1));
         let mut out: Vec<usize> = keyed.into_iter().map(|(w, _)| w).collect();
         if self.lookahead > 0 {
             self.apply_lookahead(ei, &mut out);
         }
-        out
+        (out, next)
+    }
+
+    /// Sort key (higher = tried first) of candidate `w` for `ei` under the
+    /// current optimization mode.
+    fn order_key(&mut self, ei: usize, len: usize, w: usize, sc: u8, lcv: u32) -> i64 {
+        const DEAD: i64 = i64::MIN / 2;
+        // band dominates → score order kept; jittered lcv breaks ties
+        let weak = |s: &mut Self| {
+            let j = 850 + s.rng.below(301) as i64; // 0.85..1.15
+            (sc / 5) as i64 * 1_000_000_000 + (lcv as i64 * j / 1000)
+        };
+        let letters = &self.wl.len_data(len).letters[w];
+        // per open crossing: (all its other cells filled?, best score of a
+        // compatible word, number of compatible words)
+        let crossing_info = |s: &Self| -> Vec<(bool, Option<u8>, u32)> {
+            s.crossings[ei]
+                .iter()
+                .filter(|&&(_, nbr, _)| s.assigned[nbr].is_none() && !s.is_locked[nbr])
+                .map(|&(pos, nbr, npos)| {
+                    let nld = s.wl.len_data(s.p.entries[nbr].len);
+                    let compat = nld.compat(npos, letters[pos]);
+                    let cutoff = s.cutoff_by_entry[nbr];
+                    let best = s.domains[nbr]
+                        .first_and_below(compat, cutoff)
+                        .map(|i| nld.scores[i]);
+                    let count = s.domains[nbr].count_and_below(compat, cutoff);
+                    let completed = s.p.entries[nbr]
+                        .cells
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &c)| k == npos || s.cell_letter[c].is_some());
+                    (completed, best, count)
+                })
+                .collect()
+        };
+        match self.optimize {
+            Optimize::None => (self.rng.next_u64() >> 2) as i64,
+            Optimize::Weak => weak(self),
+            Optimize::Theme => {
+                let boost = if self.theme.contains(&(len, w)) {
+                    1_000_000_000_000_000
+                } else {
+                    0
+                };
+                boost + weak(self)
+            }
+            Optimize::Strong => {
+                let info = crossing_info(self);
+                if info.iter().any(|&(_, best, _)| best.is_none()) {
+                    return DEAD;
+                }
+                let completed: i64 = info
+                    .iter()
+                    .filter(|(c, _, _)| *c)
+                    .map(|&(_, best, _)| best.unwrap_or(0) as i64)
+                    .sum();
+                (sc as i64 + completed) * 1_000_000 + self.rng.below(1000) as i64
+            }
+            Optimize::Max => {
+                let info = crossing_info(self);
+                if info.iter().any(|&(_, best, _)| best.is_none()) {
+                    return DEAD;
+                }
+                let avg = if info.is_empty() {
+                    0.0
+                } else {
+                    info.iter()
+                        .map(|&(_, b, _)| b.unwrap_or(0) as f64)
+                        .sum::<f64>()
+                        / info.len() as f64
+                };
+                let noise = 0.95 + 0.1 * (self.rng.below(1001) as f64 / 1000.0);
+                ((sc as f64 + avg) * noise * 1000.0) as i64
+            }
+            Optimize::Reliability => {
+                let info = crossing_info(self);
+                let least = info.iter().map(|&(_, _, n)| n).min().unwrap_or(u32::MAX);
+                if least == 0 {
+                    return DEAD;
+                }
+                least.min(1_000_000) as i64 * 1_000 + (sc / 5) as i64
+            }
+        }
     }
 
     /// Rescore the first `lookahead` candidates by the options they really
@@ -1539,7 +2410,7 @@ impl<'a> Solver<'a> {
         let cutoff = self.cutoff_by_entry[e];
         let ld = self.wl.len_data(self.p.entries[e].len);
         let len = self.p.entries[e].len;
-        let mut sup = vec![0u32; len * 26];
+        let mut sup = vec![0u32; len * ALPHA];
         let mut count = 0u32;
         for w in self.domains[e].iter_ones() {
             if w >= cutoff {
@@ -1547,13 +2418,13 @@ impl<'a> Solver<'a> {
             }
             count += 1;
             for (p, &c) in ld.letters[w].iter().enumerate() {
-                sup[p * 26 + c as usize] += 1;
+                sup[p * ALPHA + c as usize] += 1;
             }
         }
         let mut m = vec![0u32; len];
         for (p, mp) in m.iter_mut().enumerate() {
-            for c in 0..26 {
-                if sup[p * 26 + c] > 0 {
+            for c in 0..ALPHA {
+                if sup[p * ALPHA + c] > 0 {
                     *mp |= 1 << c;
                 }
             }
@@ -1574,7 +2445,7 @@ impl<'a> Solver<'a> {
             }
             self.dom_count[e] -= 1;
             for (p, &c) in ld.letters[w].iter().enumerate() {
-                let k = p * 26 + c as usize;
+                let k = p * ALPHA + c as usize;
                 self.support[e][k] -= 1;
                 if self.support[e][k] == 0 {
                     self.masks[e][p] &= !(1 << c);
@@ -1597,7 +2468,7 @@ impl<'a> Solver<'a> {
         let ld = self.wl.len_data(self.p.entries[e].len);
         let cutoff = self.cutoff_by_entry[e];
         let mut m = 0u32;
-        for c in 0..26u8 {
+        for c in 0..ALPHA as u8 {
             if ld.pos_count(pos, c) > 0
                 && self.domains[e].intersects_below(ld.compat(pos, c), cutoff)
             {
@@ -1647,7 +2518,7 @@ impl<'a> Solver<'a> {
                 }
                 let ld = self.wl.len_data(self.p.entries[t].len);
                 let mut drop = Bitset::zeros(ld.n.max(1));
-                for c in 0..26u8 {
+                for c in 0..ALPHA as u8 {
                     if removed & (1 << c) != 0 {
                         drop.or_assign(ld.compat(tpos, c));
                     }
@@ -2318,9 +3189,9 @@ DOG;40
             }
         }
         s.dom_count[iso] = 1;
-        s.linked = false;
+        s.linked = Linked::Off;
         assert_eq!(s.select_entry(), Some(iso));
-        s.linked = true;
+        s.linked = Linked::On;
         let pick = s.select_entry().unwrap();
         assert!(
             s.crossings[pick].iter().any(|&(_, o, _)| o == top),
@@ -2336,7 +3207,7 @@ DOG;40
             .collect();
         let cfg = SolveConfig::default().with_args(&args).unwrap();
         assert_eq!(cfg.slot_order, SlotOrder::PerCell);
-        assert!(cfg.linked);
+        assert_eq!(cfg.linked, Linked::On);
         assert!(
             cfg.describe().contains("slot-order per-cell") && cfg.describe().contains("linked on")
         );
@@ -2853,6 +3724,773 @@ DOG;40
             .repair_region(&b, &cfg, &[ben], 2, 0.5)
             .expect("radius 2 refills");
         assert_eq!(r2.weak_count, 0);
+    }
+
+    // ---- punto 12: ricerca esaustiva ----
+
+    fn impossible_2x2() -> (Puzzle, Wordlist) {
+        (
+            Puzzle::from_template("..\n..\n"),
+            Wordlist::from_str("AB;60\nAC;60\nBA;60\nBD;60\nDA;60\n", 0),
+        )
+    }
+
+    #[test]
+    fn result_tells_proven_from_not_found() {
+        let (p, wl) = impossible_2x2();
+        let r = Solver::new(&p, &wl).solve(&SolveConfig {
+            time_limit_s: 2.0,
+            ..Default::default()
+        });
+        assert_eq!(r.reason, "unsolved");
+        assert!(r.proven_unfillable, "a complete attempt is a proof");
+        // candidates come in batches: a small batch size never cuts any, so
+        // the proof survives
+        let r = Solver::new(&p, &wl).solve(&SolveConfig {
+            time_limit_s: 0.3,
+            cand_cap: 2,
+            ..Default::default()
+        });
+        assert_eq!(r.reason, "unsolved");
+        assert!(r.proven_unfillable, "batches load every candidate");
+    }
+
+    #[test]
+    fn exhaustive_mode_proves_despite_candidate_cap() {
+        let (p, wl) = impossible_2x2();
+        let r = Solver::new(&p, &wl).solve(&SolveConfig {
+            time_limit_s: 5.0,
+            cand_cap: 2,
+            exhaustive: true,
+            ..Default::default()
+        });
+        assert!(r.proven_unfillable);
+        assert!(r.elapsed_s < 1.0);
+        let p = Puzzle::from_template("...\n...\n...\n");
+        let wl = dict();
+        let r = Solver::new(&p, &wl).solve(&SolveConfig {
+            exhaustive: true,
+            ..fast_cfg()
+        });
+        assert_eq!(r.reason, "solved");
+        assert!(!r.proven_unfillable);
+    }
+
+    /// In a portfolio, any worker's proof is the result's proof; and since
+    /// proving takes one complete attempt the others are stopped at once.
+    #[test]
+    fn portfolio_reports_proof_from_any_worker() {
+        let (p, wl) = impossible_2x2();
+        // workers whose candidate cap is cut can't prove; exhaustive ones can
+        let cfg = SolveConfig {
+            time_limit_s: 5.0,
+            cand_cap: 2,
+            exhaustive: true,
+            ..Default::default()
+        };
+        let r = solve_portfolio(&p, &wl, &[], &cfg, 3).unwrap();
+        assert!(r.proven_unfillable);
+        assert!(r.elapsed_s < 1.0);
+        // forced mix: the merged result must keep the proof even if the
+        // first-listed result lacks it
+        let proven = SolveResult {
+            proven_unfillable: true,
+            ..Solver::new(&p, &wl).solve(&cfg)
+        };
+        let unproven = SolveResult {
+            proven_unfillable: false,
+            ..Solver::new(&p, &wl).solve(&cfg)
+        };
+        let merged = merge_results(vec![unproven, proven]);
+        assert!(merged.proven_unfillable);
+    }
+
+    #[test]
+    fn exhaustive_switch_option() {
+        let args: Vec<String> = vec!["--exhaustive".into(), "--time".into(), "3".into()];
+        let cfg = SolveConfig::default().with_args(&args).unwrap();
+        assert!(cfg.exhaustive);
+        assert!(cfg.describe().contains("exhaustive"));
+        assert!(SOLVER_SWITCHES.contains(&"--exhaustive"));
+        assert!(!SolveConfig::default().exhaustive);
+    }
+
+    // ---- punto 13: candidati a lotti ----
+
+    /// "?AB" across, "??E" down: in score order the across tries QAB, RAB,
+    /// then XAB — the only one with a ??E crossing (XAE). With batches of 2
+    /// the third candidate must still be reached.
+    #[test]
+    fn batches_reach_candidates_beyond_the_first() {
+        let p = Puzzle::from_template(".AB\n.##\nE##\n");
+        // four X?E downs: the across (3 candidates) is chosen first
+        let wl = Wordlist::from_str(
+            "QAB;90\nRAB;80\nXAB;70\nXAE;60\nXBE;60\nXCE;60\nXDE;60\n",
+            0,
+        );
+        let mut s = Solver::new(&p, &wl);
+        let r = s.solve(&SolveConfig {
+            propagation: Propagation::Forward, // arc would prune Q and R up front
+            cand_cap: 2,
+            cand_ratio: 1,
+            ..fast_cfg()
+        });
+        assert_eq!(r.reason, "solved");
+    }
+
+    #[test]
+    fn batch_size_is_min_of_cap_and_share_of_the_list() {
+        let mut src = String::new();
+        for i in 0..1000u32 {
+            let w: String = (0..4)
+                .map(|k| (b'A' + ((i / 26u32.pow(k)) % 26) as u8) as char)
+                .collect();
+            src.push_str(&format!("{w};60\n"));
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        let p = Puzzle::from_template("....\n");
+        let mut s = Solver::new(&p, &wl);
+        s.cand_cap = 400;
+        s.cand_ratio = 10;
+        assert_eq!(s.batch_size(0), 100, "1000 words / 10");
+        s.cand_ratio = 1;
+        assert_eq!(s.batch_size(0), 400, "capped at M");
+        s.cand_ratio = 1000;
+        assert_eq!(s.batch_size(0), MIN_BATCH, "never below the minimum");
+    }
+
+    #[test]
+    fn candidate_batch_options() {
+        let args: Vec<String> = ["--max-cands", "50", "--cand-ratio", "8"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cfg = SolveConfig::default().with_args(&args).unwrap();
+        assert_eq!((cfg.cand_cap, cfg.cand_ratio), (50, 8));
+        assert!(cfg.describe().contains("max-cands 50, cand-ratio 8"));
+        let bad: Vec<String> = vec!["--cand-ratio".into(), "0".into()];
+        assert!(
+            SolveConfig::default().with_args(&bad).is_err(),
+            "ratio must be >= 1"
+        );
+    }
+
+    // ---- punto 14: vicinanza ----
+
+    /// A chain A-B-C-D-E (each 3 letters, crossing the next): B is 1
+    /// crossing away from A, C 2, D 3, E 4. Counts fall towards E.
+    #[test]
+    fn linked_modes_restrict_by_distance_from_the_filled_part() {
+        let p = Puzzle::from_template("...####\n##.####\n##...##\n####.##\n####...\n");
+        let mut src = String::new();
+        for a in b"ABC" {
+            for b in b"ABC" {
+                for c in b"ABC" {
+                    src.push_str(&format!("{}{}{};60\n", *a as char, *b as char, *c as char));
+                }
+            }
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        let a = p.find_entry(0, 0, Dir::Across).unwrap();
+        let b = p.find_entry(0, 2, Dir::Down).unwrap();
+        let c = p.find_entry(2, 2, Dir::Across).unwrap();
+        let d = p.find_entry(2, 4, Dir::Down).unwrap();
+        let e = p.find_entry(4, 4, Dir::Across).unwrap();
+        let mut s = Solver::new(&p, &wl);
+        s.reset(0);
+        let _f = s.assign(a, 0);
+        for (ei, cnt) in [(b, 9), (c, 8), (d, 7), (e, 6)] {
+            s.dom_count[ei] = cnt;
+        }
+        s.linked = Linked::Off;
+        assert_eq!(s.select_entry(), Some(e));
+        s.linked = Linked::On;
+        assert_eq!(s.select_entry(), Some(b));
+        s.linked = Linked::Near;
+        assert_eq!(s.select_entry(), Some(c));
+        let args: Vec<String> = vec!["--linked".into(), "near".into()];
+        assert_eq!(
+            SolveConfig::default().with_args(&args).unwrap().linked,
+            Linked::Near
+        );
+        assert!(SolveConfig::default()
+            .with_args(&args)
+            .unwrap()
+            .describe()
+            .contains("linked near"));
+    }
+
+    // ---- punto 15: apprendimento tra i riavvii ----
+
+    /// "?AB" across, "??E" down, forward checking only: QAB and RAB leave the
+    /// down with no word — a failure owed to no earlier choice, so they are
+    /// impossible in any fill and must be learned.
+    #[test]
+    fn learns_candidates_impossible_on_their_own() {
+        let p = Puzzle::from_template(".AB\n.##\nE##\n");
+        // four X?E downs: the across (3 candidates) is chosen first
+        let wl = Wordlist::from_str(
+            "QAB;90\nRAB;80\nXAB;70\nXAE;60\nXBE;60\nXCE;60\nXDE;60\n",
+            0,
+        );
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let mut s = Solver::new(&p, &wl);
+        let r = s.solve(&SolveConfig {
+            propagation: Propagation::Forward,
+            learn: true,
+            ..fast_cfg()
+        });
+        assert_eq!(r.reason, "solved");
+        let qab = wl.len_data(3).index_of(&[16, 0, 1]).unwrap();
+        let rab = wl.len_data(3).index_of(&[17, 0, 1]).unwrap();
+        // proven at the solve's lowest floor (50)
+        assert!(s.learned.contains(&(across, qab, 50)) && s.learned.contains(&(across, rab, 50)));
+        // applied at the next reset at that floor: only XAB is left
+        s.reset(50);
+        assert_eq!(s.dom_count[across], 1);
+    }
+
+    /// A nogood proven at a high floor (fewer words) must not prune at a
+    /// lower floor, where more words may rescue it.
+    #[test]
+    fn learned_nogoods_respect_the_floor() {
+        let p = Puzzle::from_template(".AB\n.##\nE##\n");
+        let wl = Wordlist::from_str("XAB;90\nXAE;55\n", 0);
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let mut s = Solver::new(&p, &wl);
+        s.learned.push((across, 0, 60)); // XAB impossible at floor 60
+        s.reset(60);
+        assert_eq!(s.dom_count[across], 0);
+        s.reset(50);
+        assert_eq!(s.dom_count[across], 1, "XAE;55 makes XAB fine at floor 50");
+    }
+
+    /// Learning never loses a fill: on random small cases, a solve with
+    /// learning (tiny budgets → many restarts) finds a fill whenever the
+    /// exhaustive search says one exists.
+    #[test]
+    fn learning_never_loses_solutions() {
+        let mut rng = Rng::new(31);
+        let letters = b"ABCDE";
+        let templates = [
+            "...\n...\n...\n",
+            "....\n.#..\n....\n",
+            "..#..\n.....\n..#..\n",
+        ];
+        let mut solvable = 0;
+        for round in 0..150 {
+            let t = templates[round % templates.len()];
+            let mut src = String::new();
+            for len in 2..=5 {
+                for _ in 0..(8 + rng.below(20)) {
+                    let w: String = (0..len).map(|_| letters[rng.below(5)] as char).collect();
+                    src.push_str(&format!("{w};{}\n", 50 + rng.below(40)));
+                }
+            }
+            let wl = Wordlist::from_str(&src, 0);
+            let p = Puzzle::from_template(t);
+            if !wl.missing_lengths(&p).is_empty() {
+                continue;
+            }
+            let (truth, _) = exhaust(&p, &wl, false);
+            for prop in [Propagation::Forward, Propagation::Arc] {
+                let r = Solver::new(&p, &wl).solve(&SolveConfig {
+                    time_limit_s: 1.0,
+                    stop_on_first: true,
+                    initial_budget: 3, // tiny attempts: many restarts to learn in
+                    max_budget: 512,
+                    learn: true,
+                    propagation: prop,
+                    ..Default::default()
+                });
+                if truth == Outcome::Solved {
+                    assert_eq!(r.reason, "solved", "round {round} {prop:?}: {t:?} {src:?}");
+                    assert!(!r.proven_unfillable);
+                } else {
+                    assert_ne!(r.reason, "solved");
+                }
+            }
+            solvable += (truth == Outcome::Solved) as usize;
+        }
+        assert!(solvable > 10);
+    }
+
+    #[test]
+    fn learn_option() {
+        let args: Vec<String> = vec!["--learn".into(), "on".into()];
+        let cfg = SolveConfig::default().with_args(&args).unwrap();
+        assert!(cfg.learn);
+        assert!(cfg.describe().contains("learn on"));
+        let bad: Vec<String> = vec!["--learn".into(), "x".into()];
+        assert!(SolveConfig::default().with_args(&bad).is_err());
+    }
+
+    // ---- punto 16: modalità di ottimizzazione ----
+
+    fn first_candidate(p: &Puzzle, wl: &Wordlist, ei: usize, mode: Optimize, seed: u64) -> usize {
+        let mut s = Solver::new(p, wl);
+        s.optimize = mode;
+        s.propagation = Propagation::Forward;
+        s.rng = Rng::new(seed);
+        s.reset(0);
+        s.ordered_candidates(ei)[0]
+    }
+
+    /// "?" + "AB": the across chooses its first letter, which completes the
+    /// down "?Z" (its other cell is prefilled). XAB (75) completes XZ (50);
+    /// YAB (70) completes YZ (90). Weak looks at the word's own band only;
+    /// strong adds the score of the word it completes.
+    fn completion_case() -> (Puzzle, Wordlist) {
+        (
+            Puzzle::from_template(".AB\nZ##\n"),
+            Wordlist::from_str("XAB;75\nYAB;70\nXZ;50\nYZ;90\n", 0),
+        )
+    }
+
+    #[test]
+    fn strong_mode_counts_completed_crossings() {
+        let (p, wl) = completion_case();
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let xab = wl.len_data(3).index_of(&[23, 0, 1]).unwrap();
+        let yab = wl.len_data(3).index_of(&[24, 0, 1]).unwrap();
+        assert_eq!(first_candidate(&p, &wl, across, Optimize::Weak, 1), xab);
+        assert_eq!(first_candidate(&p, &wl, across, Optimize::Strong, 1), yab);
+    }
+
+    /// The down "??" isn't completed by the across, but the best word still
+    /// reachable after XAB is XQ (50), after YAB it is YQ (90).
+    #[test]
+    fn max_mode_looks_at_best_reachable_crossing_score() {
+        let p = Puzzle::from_template(".AB\n.##\n");
+        let wl = Wordlist::from_str("XAB;75\nYAB;70\nXQ;50\nYQ;90\n", 0);
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let yab = wl.len_data(3).index_of(&[24, 0, 1]).unwrap();
+        for seed in 0..5 {
+            assert_eq!(first_candidate(&p, &wl, across, Optimize::Max, seed), yab);
+        }
+    }
+
+    /// Reliability prefers the candidate that leaves the most options: after
+    /// XAB the down has 1 word, after YAB it has 3.
+    #[test]
+    fn reliability_mode_prefers_least_constraining() {
+        let p = Puzzle::from_template(".AB\n.##\n");
+        let wl = Wordlist::from_str("XAB;75\nYAB;70\nXQ;60\nYQ;60\nYR;60\nYS;60\n", 0);
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let yab = wl.len_data(3).index_of(&[24, 0, 1]).unwrap();
+        assert_eq!(
+            first_candidate(&p, &wl, across, Optimize::Reliability, 1),
+            yab
+        );
+    }
+
+    /// None ignores scores: over several seeds the top-scored word is not
+    /// always first.
+    #[test]
+    fn none_mode_ignores_scores() {
+        let p = Puzzle::from_template("...\n");
+        let mut src = String::new();
+        for (i, w) in ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH"]
+            .iter()
+            .enumerate()
+        {
+            src.push_str(&format!("{w};{}\n", 90 - i * 5));
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        let firsts: std::collections::HashSet<usize> = (0..20)
+            .map(|seed| first_candidate(&p, &wl, 0, Optimize::None, seed))
+            .collect();
+        assert!(firsts.len() > 2, "random order: {firsts:?}");
+        let weak: std::collections::HashSet<usize> = (0..20)
+            .map(|seed| first_candidate(&p, &wl, 0, Optimize::Weak, seed))
+            .collect();
+        assert_eq!(weak.len(), 1, "weak always starts from the best band");
+    }
+
+    /// Theme mode puts theme words first, whatever their score.
+    #[test]
+    fn theme_mode_prefers_theme_words() {
+        let p = Puzzle::from_template("...\n");
+        let wl = Wordlist::from_str("AAA;90\nBBB;80\nCCC;55\n", 0);
+        let ccc = wl.len_data(3).index_of(&[2, 2, 2]).unwrap();
+        let mut s = Solver::new(&p, &wl);
+        s.optimize = Optimize::Theme;
+        s.theme = std::sync::Arc::new([(3usize, ccc)].into_iter().collect());
+        s.reset(0);
+        assert_eq!(s.ordered_candidates(0)[0], ccc);
+        assert_eq!(
+            theme_ids(&wl, &["ccc".to_string(), "zzz".to_string()]).len(),
+            1
+        );
+        let f = std::env::temp_dir().join(format!("xfill-theme-{}.txt", std::process::id()));
+        std::fs::write(&f, "# t\nCCC\n\nqqq\n").unwrap();
+        let (ids, total) = load_theme(f.to_str().unwrap(), &wl).unwrap();
+        std::fs::remove_file(&f).ok();
+        assert_eq!((ids.len(), total), (1, 2));
+        assert!(load_theme("/nonexistent/theme.txt", &wl).is_err());
+    }
+
+    #[test]
+    fn optimize_option() {
+        for (v, m) in [
+            ("none", Optimize::None),
+            ("weak", Optimize::Weak),
+            ("strong", Optimize::Strong),
+            ("max", Optimize::Max),
+            ("reliability", Optimize::Reliability),
+            ("theme", Optimize::Theme),
+        ] {
+            let args: Vec<String> = vec!["--optimize".into(), v.into()];
+            let cfg = SolveConfig::default().with_args(&args).unwrap();
+            assert_eq!(cfg.optimize, m);
+            assert!(cfg.describe().contains(&format!("optimize {v}")));
+        }
+        let bad: Vec<String> = vec!["--optimize".into(), "x".into()];
+        assert!(SolveConfig::default().with_args(&bad).is_err());
+    }
+
+    // ---- punto 17: N migliori soluzioni ----
+
+    /// Independent oracle: every fill of the open 3x3 by brute force over
+    /// the across rows, as (total score, rows) sorted best first.
+    fn all_fills_3x3(src: &str) -> Vec<(u32, [String; 3])> {
+        let words: Vec<(String, u32)> = src
+            .lines()
+            .filter_map(|l| l.split_once(';'))
+            .map(|(w, s)| (w.to_string(), s.parse().unwrap()))
+            .collect();
+        let score = |w: &str| words.iter().find(|(x, _)| x == w).map(|(_, s)| *s);
+        let mut out = Vec::new();
+        for a in &words {
+            for b in &words {
+                for c in &words {
+                    let rows = [a.0.as_str(), b.0.as_str(), c.0.as_str()];
+                    let cols: Vec<String> = (0..3)
+                        .map(|k| rows.iter().map(|r| r.as_bytes()[k] as char).collect())
+                        .collect();
+                    let all: Vec<&str> = rows
+                        .iter()
+                        .copied()
+                        .chain(cols.iter().map(|s| s.as_str()))
+                        .collect();
+                    let distinct: std::collections::HashSet<&str> = all.iter().copied().collect();
+                    if distinct.len() < 6 || cols.iter().any(|c| score(c).is_none()) {
+                        continue;
+                    }
+                    let total: u32 = all.iter().map(|w| score(w).unwrap()).sum();
+                    out.push((total, [a.0.clone(), b.0.clone(), c.0.clone()]));
+                }
+            }
+        }
+        out.sort_by_key(|x| std::cmp::Reverse(x.0));
+        out
+    }
+
+    #[test]
+    fn best_fills_match_brute_force() {
+        let mut rng = Rng::new(5);
+        let mut src = String::new();
+        for _ in 0..40 {
+            let w: String = (0..3)
+                .map(|_| (b'A' + rng.below(4) as u8) as char)
+                .collect();
+            src.push_str(&format!("{w};{}\n", 50 + rng.below(50)));
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        // the oracle uses the list as loaded (first occurrence of a word wins)
+        let loaded: String = (0..wl.len_data(3).n)
+            .map(|i| {
+                format!(
+                    "{};{}\n",
+                    wl.len_data(3).word_string(i),
+                    wl.len_data(3).scores[i]
+                )
+            })
+            .collect();
+        let oracle = all_fills_3x3(&loaded);
+        assert!(
+            oracle.len() >= 5,
+            "the case needs several fills: {}",
+            oracle.len()
+        );
+        let p = Puzzle::from_template("...\n...\n...\n");
+        let mut s = Solver::new(&p, &wl);
+        let (fills, optimal) = s.best_fills(
+            &SolveConfig {
+                time_limit_s: 10.0,
+                tiers: vec![0],
+                ..Default::default()
+            },
+            4,
+        );
+        assert!(optimal, "search completed");
+        assert_eq!(fills.len(), 4);
+        for (k, f) in fills.iter().enumerate() {
+            let total = (f.mean_score * 6.0).round() as u32;
+            assert_eq!(total, oracle[k].0, "rank {k}");
+        }
+    }
+
+    #[test]
+    fn best_fills_on_unfillable_grid_is_empty_and_optimal() {
+        let (p, wl) = impossible_2x2();
+        let (fills, optimal) = Solver::new(&p, &wl).best_fills(&SolveConfig::default(), 3);
+        assert!(fills.is_empty() && optimal);
+    }
+
+    // ---- punto 18: parallelo split ----
+
+    #[test]
+    fn split_partitions_the_first_entry_candidates() {
+        let p = Puzzle::from_template("...\n...\n...\n");
+        let mut src = String::new();
+        for a in b"ABC" {
+            for b in b"ABC" {
+                for c in b"ABC" {
+                    src.push_str(&format!("{}{}{};60\n", *a as char, *b as char, *c as char));
+                }
+            }
+        }
+        let wl = Wordlist::from_str(&src, 0);
+        let (ei, parts) = split_first_entry(&p, &wl, &[], &SolveConfig::default(), 4).unwrap();
+        assert_eq!(parts.len(), 4);
+        let mut union = Bitset::zeros(wl.len_data(3).n);
+        for (i, a) in parts.iter().enumerate() {
+            for b in &parts[i + 1..] {
+                assert_eq!(a.count_and_below(b, usize::MAX), 0, "disjoint");
+            }
+            union.or_assign(a);
+        }
+        let mut s = Solver::new(&p, &wl);
+        s.reset(50);
+        assert_eq!(
+            union.count_ones(),
+            s.dom_count[ei],
+            "covers every candidate"
+        );
+        assert!(parts.iter().all(|b| b.count_ones() > 0), "balanced enough");
+    }
+
+    #[test]
+    fn split_mode_proves_only_when_every_part_is_proven() {
+        let (p, wl) = impossible_2x2();
+        let cfg = SolveConfig {
+            time_limit_s: 3.0,
+            parallel: Parallel::Split,
+            ..Default::default()
+        };
+        let r = solve_portfolio(&p, &wl, &[], &cfg, 3).unwrap();
+        assert!(r.proven_unfillable);
+        let p3 = Puzzle::from_template("...\n...\n...\n");
+        let w3 = dict();
+        let r = solve_portfolio(
+            &p3,
+            &w3,
+            &[],
+            &SolveConfig {
+                stop_on_first: true,
+                ..cfg
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(r.reason, "solved");
+        // merging: one part proven, another not → no proof for the whole
+        let proven = SolveResult {
+            proven_unfillable: true,
+            ..Solver::new(&p, &wl).solve(&SolveConfig::default())
+        };
+        let open = SolveResult {
+            proven_unfillable: false,
+            ..proven.clone()
+        };
+        assert!(!merge_split_results(vec![proven.clone(), open]).proven_unfillable);
+        assert!(merge_split_results(vec![proven.clone(), proven]).proven_unfillable);
+    }
+
+    #[test]
+    fn auto_threads_rule() {
+        assert_eq!(auto_threads(10, 1000), 8, "capped at 8");
+        assert_eq!(auto_threads(4, 1000), 3, "one CPU left free");
+        assert_eq!(auto_threads(1, 1000), 1);
+        assert_eq!(
+            auto_threads(10, 2),
+            2,
+            "no more threads than first-entry candidates"
+        );
+        let args: Vec<String> = vec!["--parallel".into(), "split".into()];
+        let cfg = SolveConfig::default().with_args(&args).unwrap();
+        assert_eq!(cfg.parallel, Parallel::Split);
+        assert!(cfg.describe().contains("parallel split"));
+        let bad: Vec<String> = vec!["--parallel".into(), "x".into()];
+        assert!(SolveConfig::default().with_args(&bad).is_err());
+    }
+
+    // ---- punto 19: thread a basso consumo ----
+
+    #[test]
+    fn eco_option_and_portfolio() {
+        let args: Vec<String> = vec!["--eco".into()];
+        let cfg = SolveConfig::default().with_args(&args).unwrap();
+        assert!(cfg.eco);
+        assert!(cfg.describe().contains("eco"));
+        assert!(SOLVER_SWITCHES.contains(&"--eco"));
+        let p = Puzzle::from_template("...\n...\n...\n");
+        let wl = dict();
+        let r = solve_portfolio(
+            &p,
+            &wl,
+            &[],
+            &SolveConfig {
+                stop_on_first: true,
+                ..cfg
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(r.reason, "solved");
+    }
+
+    // ---- punto 20: pangramma ----
+
+    fn letters_in(fill: &[(usize, String, u8)]) -> std::collections::HashSet<char> {
+        fill.iter().flat_map(|(_, w, _)| w.chars()).collect()
+    }
+
+    /// Two independent 3-letter entries. The best-scored pair AAB + BBA uses
+    /// only A and B; with a pangram over A, B, C, D the solver must pick a
+    /// pair covering all four (ABC + DDA).
+    #[test]
+    fn pangram_requires_every_letter() {
+        let p = Puzzle::from_template("...#...\n");
+        let wl = Wordlist::from_str("AAB;90\nBBA;90\nABC;60\nDDA;60\n", 0);
+        let base = SolveConfig {
+            pangram_alphabet: "ABCD".into(),
+            ..fast_cfg()
+        };
+        let r = Solver::new(&p, &wl).solve(&base);
+        let l = letters_in(r.fill.as_ref().unwrap());
+        assert!(
+            !l.contains(&'C') || !l.contains(&'D'),
+            "without the constraint: {l:?}"
+        );
+        let r = Solver::new(&p, &wl).solve(&SolveConfig { pangram: 1, ..base });
+        assert_eq!(r.reason, "solved");
+        let l = letters_in(r.fill.as_ref().unwrap());
+        assert!("ABCD".chars().all(|c| l.contains(&c)), "{l:?}");
+    }
+
+    #[test]
+    fn pangram_with_a_missing_letter_is_proven_impossible() {
+        let p = Puzzle::from_template("...#...\n");
+        let wl = Wordlist::from_str("AAB;90\nBBA;90\nABC;60\nDDA;60\n", 0);
+        let r = Solver::new(&p, &wl).solve(&SolveConfig {
+            time_limit_s: 3.0,
+            pangram: 1,
+            pangram_alphabet: "ABCDZ".into(),
+            ..Default::default()
+        });
+        assert_eq!(r.reason, "unsolved");
+        assert!(r.proven_unfillable);
+        assert!(r.elapsed_s < 0.5);
+    }
+
+    #[test]
+    fn pangram_options() {
+        let args: Vec<String> = ["--pangram", "2", "--pangram-alphabet", "abc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cfg = SolveConfig::default().with_args(&args).unwrap();
+        assert_eq!((cfg.pangram, cfg.pangram_alphabet.as_str()), (2, "ABC"));
+        assert!(cfg.describe().contains("pangram 2"));
+        assert_eq!(SolveConfig::default().pangram, 0);
+        assert_eq!(
+            SolveConfig::default().pangram_alphabet,
+            "ABCDEFGHILMNOPQRSTUVZ"
+        );
+        let bad: Vec<String> = vec!["--pangram".into(), "x".into()];
+        assert!(SolveConfig::default().with_args(&bad).is_err());
+    }
+
+    // ---- punto 21: rebus ----
+
+    #[test]
+    fn rebus_cell_is_filled_by_words_containing_the_string() {
+        // across C[RE]DO; the down starts in the rebus cell: RE·X = REX
+        let p = Puzzle::from_template("C[RE]DO\n#.##\n");
+        let wl = Wordlist::from_str_rebus(
+            "CREDO;80\nREX;70\nCAR;60\n",
+            0,
+            &Default::default(),
+            &p.rebus,
+        );
+        let r = Solver::new(&p, &wl).solve(&fast_cfg());
+        assert_eq!(r.reason, "solved");
+        let words: Vec<String> = r.fill.unwrap().into_iter().map(|(_, w, _)| w).collect();
+        assert!(
+            words.contains(&"CREDO".to_string()) && words.contains(&"REX".to_string()),
+            "{words:?}"
+        );
+    }
+
+    #[test]
+    fn rebus_symbols_stay_out_of_plain_cells_unless_free() {
+        let p = Puzzle::from_template("....\n");
+        let free = vec!["RE".to_string()];
+        let wl = Wordlist::from_str_rebus("CREDO;80\n", 0, &Default::default(), &free);
+        // fixed rebus only: an ordinary 4-cell slot can't take C·RE·DO
+        let r = Solver::new(&p, &wl).solve(&SolveConfig {
+            time_limit_s: 1.0,
+            ..Default::default()
+        });
+        assert_eq!(r.reason, "unsolved");
+        // free rebus: the solver may put RE in any cell
+        let mut s = Solver::new(&p, &wl);
+        s.allow_free_rebus(&free);
+        let r = s.solve(&fast_cfg());
+        assert_eq!(r.reason, "solved");
+        assert_eq!(r.fill.unwrap()[0].1, "CREDO");
+        // the same through the configuration (as the portfolio uses it)
+        let cfg = SolveConfig {
+            free_rebus: free.clone(),
+            ..fast_cfg()
+        };
+        let r = solve_portfolio(&p, &wl, &[], &cfg, 2).unwrap();
+        assert_eq!(r.reason, "solved");
+    }
+
+    // ---- punto 23: selezione guidata ----
+
+    #[test]
+    fn suggestions_rank_by_score_with_completed_crossings() {
+        let (p, wl) = completion_case(); // XAB 75 completes XZ 50; YAB 70 completes YZ 90
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let sug = Solver::new(&p, &wl).suggest(across, 10, 0.0);
+        let words: Vec<&str> = sug.candidates.iter().map(|c| c.word.as_str()).collect();
+        assert_eq!(words, vec!["YAB", "XAB"]);
+        assert_eq!(
+            (sug.candidates[0].score, sug.candidates[1].score),
+            (160, 125)
+        );
+        assert!(sug.candidates.iter().all(|c| c.fill_score > 0.0));
+    }
+
+    #[test]
+    fn suggestions_list_forced_words_and_check_the_rest() {
+        let p = Puzzle::from_template(".AB\n.##\nE##\n");
+        let wl = Wordlist::from_str("XAB;60\nZAB;60\nXAE;60\n", 0);
+        let across = p.find_entry(0, 0, Dir::Across).unwrap();
+        let down = p.find_entry(0, 0, Dir::Down).unwrap();
+        let sug = Solver::new(&p, &wl).suggest(across, 10, 1.0);
+        assert_eq!(sug.candidates.len(), 1, "ZAB leaves the down without words");
+        assert!(sug.forced.contains(&(down, "XAE".to_string())));
+        assert!(sug.forced.contains(&(across, "XAB".to_string())));
+        assert_eq!(
+            sug.candidates[0].fillable,
+            Some(true),
+            "checked: the rest fills"
+        );
     }
 
     #[test]
