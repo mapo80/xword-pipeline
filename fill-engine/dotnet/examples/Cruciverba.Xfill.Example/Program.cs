@@ -39,8 +39,17 @@ Console.WriteLine($"{result.Cols} × {result.Rows}: {result.Blocks} blocks, {res
     $"{result.WeakWords.Count} weak, {result.Attempts} attempts, {result.DurationMs} ms");
 Console.WriteLine($"theme words: {result.ThemeCount} ({string.Join(", ", result.ThemeWords)})");
 var report = XfillEngine.Validate(ValidateInput.FromResult(result));
-Console.WriteLine($"validation: {(report.Valid ? "ok" : string.Join("; ", report.Errors.Select(e => e.Message)))}");
-return report.Valid ? 0 : 2;
+Console.WriteLine($"validation: {(report.Valid ? "ok" : string.Join("; ", report.Errors.Select(e => $"{e.Code} {e.Message}")))}");
+if (!report.Valid)
+{
+    return 2;
+}
+if (result.ThemeCount == 0 || result.ThemeWords.Count != result.ThemeCount)
+{
+    Console.WriteLine("no theme word counted");
+    return 3;
+}
+return 0;
 
 static byte[] SyntheticCsv()
 {
@@ -52,7 +61,9 @@ static byte[] SyntheticCsv()
         words = words.SelectMany(w => alpha.Select(c => w + c)).ToList();
         for (int i = 0; i < words.Count; i += len < 5 ? 1 : 5)
         {
-            csv.Append(words[i]).Append(",Voce ").Append(len).Append('-').Append(i).Append('\n');
+            // some words only have a clue that spells them: the engine must not publish it
+            string clue = len >= 3 && i % 7 == 0 ? $"La parola {words[i]}" : $"Voce {len}-{i}";
+            csv.Append(words[i]).Append(',').Append(clue).Append('\n');
         }
     }
     return Encoding.UTF8.GetBytes(csv.ToString());

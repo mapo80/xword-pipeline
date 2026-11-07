@@ -702,6 +702,18 @@ pub fn generate(dict: &Dictionary, req: &GenerateRequest, cancel: &CancelFlag) -
     kept.truncate(1);
     if req.clues {
         assign_clues(&mut kept, &dict.clues, req.seed);
+        // never publish a clue that spells its answer (the dictionary picks
+        // one when it has nothing else): the entry stays without a clue
+        for g in &mut kept {
+            for e in &mut g.entries {
+                if e.clue
+                    .as_deref()
+                    .is_some_and(|c| clue_contains_answer(c, &e.answer))
+                {
+                    e.clue = None;
+                }
+            }
+        }
     }
     let Some(g) = kept.pop() else {
         let msg = format!("none of {} patterns filled within the budget", run.done);
@@ -789,6 +801,13 @@ pub struct ValidationReport {
     pub warnings: Vec<Issue>,
     /// Entries expected from the black pattern.
     pub slots: usize,
+}
+
+/// The clue spells the answer (answers of 3+ letters; letters compared
+/// after folding accents and dropping punctuation).
+pub fn clue_contains_answer(clue: &str, answer: &str) -> bool {
+    let answer = answer.to_uppercase();
+    answer.chars().count() >= 3 && crate::clues::normalize_letters_lossy(clue).contains(&answer)
 }
 
 fn issue(code: &str, message: String, e: Option<&EntryOut>) -> Issue {
@@ -965,8 +984,7 @@ pub fn validate(input: &ValidateInput) -> ValidationReport {
                 Some(e),
             )),
             Some(clue) => {
-                let norm = crate::clues::normalize_letters_lossy(clue);
-                if answer.len() >= 3 && norm.contains(&e.answer.to_uppercase()) {
+                if clue_contains_answer(clue, &e.answer) {
                     errors.push(issue(
                         "clue_contains_answer",
                         format!("the clue of entry {} contains the answer", e.number),
@@ -1446,5 +1464,47 @@ mod tests {
         };
         assert_eq!(plan_for(&d.words, &explicit).unwrap().0.stop_after, 7);
         assert_eq!(plain.candidates, DEFAULT_CANDIDATES);
+    }
+
+    /// A generated grid always passes validation: a clue that spells its
+    /// answer is never published (the entry stays without a clue).
+    #[test]
+    fn generated_grids_never_carry_clues_containing_the_answer() {
+        // every word of 3+ letters has only a clue that contains it
+        let csv: String = csv()
+            .lines()
+            .map(|l| {
+                let w = l.split(',').next().unwrap();
+                if w.len() >= 3 {
+                    format!("{w},La parola {w}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let d = Dictionary::from_csv_bytes(csv.as_bytes()).unwrap();
+        for seed in 1..=3 {
+            let r = generate(
+                &d,
+                &GenerateRequest {
+                    seed,
+                    ..small(7, 7)
+                },
+                &cancel_flag(),
+            );
+            assert_eq!(r.status, Status::Ok);
+            let v = validate(&ValidateInput {
+                rows: r.rows,
+                cols: r.cols,
+                grid: r.grid.clone(),
+                entries: r.entries.clone(),
+            });
+            assert!(v.valid, "seed {seed}: {:?}", v.errors);
+            assert!(r
+                .entries
+                .iter()
+                .filter(|e| e.length >= 3)
+                .all(|e| e.clue.is_none()));
+        }
     }
 }
