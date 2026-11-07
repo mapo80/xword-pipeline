@@ -20,6 +20,8 @@ pub struct LibEntry {
     pub score: u8,
     /// Clue text, filled in from the clue database after selection.
     pub clue: Option<String>,
+    /// The answer is a theme word (see [`mark_theme`]).
+    pub is_theme: bool,
 }
 
 pub struct LibGrid {
@@ -29,6 +31,8 @@ pub struct LibGrid {
     /// Searched entries under the solver's weak bar (see
     /// `SolveConfig::weak_bar`).
     pub weak: usize,
+    /// Entries whose answer is a theme word.
+    pub theme: usize,
     pub template: Vec<String>,
     pub fill: Vec<String>,
     pub entries: Vec<LibEntry>,
@@ -46,6 +50,7 @@ pub fn build_lib_grid(p: &Puzzle, r: &SolveResult) -> Option<LibGrid> {
         mean_score: r.mean_score?,
         min_score: r.min_score?,
         weak_count: r.weak_count.unwrap_or(0),
+        theme_count: 0,
         fill: r.fill.clone()?,
     };
     Some(from_fill(p, &f))
@@ -67,6 +72,7 @@ fn from_fill(p: &Puzzle, f: &SolvedFill) -> LibGrid {
                 answer: ans.clone(),
                 score: *sc,
                 clue: None,
+                is_theme: false,
             }
         })
         .collect();
@@ -76,6 +82,7 @@ fn from_fill(p: &Puzzle, f: &SolvedFill) -> LibGrid {
         mean: f.mean_score,
         min: f.min_score,
         weak: f.weak_count,
+        theme: f.theme_count,
         template: p.render(None).lines().map(str::to_string).collect(),
         fill: p
             .render(Some(&f.letters))
@@ -86,8 +93,30 @@ fn from_fill(p: &Puzzle, f: &SolvedFill) -> LibGrid {
     }
 }
 
-/// Order kept grids for output and collapse duplicates: fewest weak entries
-/// first (mean breaks ties — the solver's own clean-track ordering), then
+/// Flag the entries of `g` whose answer is a theme word (`theme` holds
+/// (length, word index) in `wl`) and recount `g.theme`.
+pub fn mark_theme(
+    g: &mut LibGrid,
+    wl: &crate::wordlist::Wordlist,
+    theme: &std::collections::HashSet<(usize, usize)>,
+) {
+    for e in &mut g.entries {
+        let letters: Vec<u8> = e.answer.bytes().map(|b| b.wrapping_sub(b'A')).collect();
+        e.is_theme = !theme.is_empty()
+            && letters.len() == e.len
+            && e.len < wl.by_len.len()
+            && wl
+                .len_data(e.len)
+                .index_of(&letters)
+                .is_some_and(|w| theme.contains(&(e.len, w)));
+    }
+    g.theme = g.entries.iter().filter(|e| e.is_theme).count();
+}
+
+/// Order kept grids for output and collapse duplicates: highest
+/// `theme_weight` × theme words − weak entries first (without a weight:
+/// fewest weak entries), mean breaking ties — the solver's own clean-track
+/// ordering — then
 /// drop exact-duplicate FILLS, then keep at most `per_shape` fills of any one
 /// template (0 = unlimited). Callers truncate to their `top` afterwards.
 ///
@@ -99,13 +128,17 @@ fn from_fill(p: &Puzzle, f: &SolvedFill) -> LibGrid {
 /// discarded the best fill of each. Different fills of one shape are
 /// different puzzles (minis reuse a few shapes daily), so they are kept, up
 /// to the cap; exact-duplicate fills are never worth keeping twice.
-pub fn select_keepers(mut kept: Vec<LibGrid>, per_shape: usize) -> Vec<LibGrid> {
+pub fn select_keepers(mut kept: Vec<LibGrid>, per_shape: usize, theme_weight: f64) -> Vec<LibGrid> {
+    let key = |g: &LibGrid| theme_weight * g.theme as f64 - g.weak as f64;
     kept.sort_by(|a, b| {
-        a.weak.cmp(&b.weak).then(
-            b.mean
-                .partial_cmp(&a.mean)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.mean
+                    .partial_cmp(&a.mean)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
     let mut seen_fill: HashSet<String> = HashSet::new();
     let mut per_tpl: HashMap<String, usize> = HashMap::new();
@@ -251,6 +284,7 @@ mod tests {
             mean: 0.0,
             min: 0,
             weak: 0,
+            theme: 0,
             template: Vec::new(),
             fill: Vec::new(),
             entries,
@@ -278,10 +312,47 @@ mod tests {
             shaped("A", "a-mid", 0, 85.0),
             shaped("A", "a-third", 1, 90.0),
         ];
-        let out = select_keepers(kept, 2);
+        let out = select_keepers(kept, 2, 0.0);
         let fills: Vec<&str> = out.iter().map(|g| g.fill[0].as_str()).collect();
         // Fewest-weak-then-mean order, and shape A capped at its two best.
         assert_eq!(fills, vec!["a-best", "a-mid", "b-only"]);
+    }
+
+    /// With a theme weight, a grid with more theme words can outrank one with
+    /// fewer weak entries.
+    #[test]
+    fn select_keepers_weighs_theme_words() {
+        let themed = |fill: &str, weak, mean, theme| {
+            let mut g = shaped(fill, fill, weak, mean);
+            g.theme = theme;
+            g
+        };
+        let kept = || vec![themed("plain", 0, 80.0, 1), themed("themed", 2, 75.0, 6)];
+        let first = |w| select_keepers(kept(), 0, w)[0].fill[0].clone();
+        assert_eq!(first(0.0), "plain");
+        assert_eq!(first(1.0), "themed", "1×5 more theme words > 2 more weak");
+    }
+
+    #[test]
+    fn mark_theme_flags_theme_answers() {
+        let wl = crate::wordlist::Wordlist::from_str("CASA;60\nROMA;70\n", 0);
+        let roma = wl.len_data(4).index_of(&[17, 14, 12, 0]).unwrap();
+        let entry = |answer: &str| LibEntry {
+            num: 1,
+            dir: 'A',
+            row: 0,
+            col: 0,
+            len: answer.len(),
+            answer: answer.to_string(),
+            score: 60,
+            clue: None,
+            is_theme: false,
+        };
+        let mut g = grid(vec![entry("CASA"), entry("ROMA"), entry("XY")]);
+        mark_theme(&mut g, &wl, &[(4usize, roma)].into_iter().collect());
+        let flags: Vec<bool> = g.entries.iter().map(|e| e.is_theme).collect();
+        assert_eq!(flags, vec![false, true, false]);
+        assert_eq!(g.theme, 1);
     }
 
     #[test]
@@ -294,10 +365,10 @@ mod tests {
                 shaped("A", "third", 0, 88.0),
             ]
         };
-        let out = select_keepers(kept(), 0);
+        let out = select_keepers(kept(), 0, 0.0);
         assert_eq!(out.len(), 3, "duplicate fill collapses; no per-shape cap");
         assert_eq!(
-            select_keepers(kept(), 1).len(),
+            select_keepers(kept(), 1, 0.0).len(),
             1,
             "cap 1 keeps the best only"
         );

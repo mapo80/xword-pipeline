@@ -282,6 +282,29 @@ impl Wordlist {
         &self.by_len[len]
     }
 
+    /// Number of words (all lengths).
+    pub fn word_count(&self) -> usize {
+        self.by_len.iter().map(|l| l.n).sum()
+    }
+
+    /// Approximate heap memory held by the list and its masks (bytes).
+    pub fn heap_bytes(&self) -> usize {
+        self.by_len
+            .iter()
+            .map(|l| {
+                l.letters.iter().map(|w| w.len()).sum::<usize>()
+                    + l.letters.capacity() * std::mem::size_of::<Box<[u8]>>()
+                    + l.scores.capacity()
+                    + l.compat
+                        .iter()
+                        .map(|b| b.heap_bytes() + std::mem::size_of::<crate::bitset::Bitset>())
+                        .sum::<usize>()
+                    + l.pos_count.capacity() * std::mem::size_of::<u32>()
+            })
+            .sum::<usize>()
+            + self.rebus.iter().map(String::capacity).sum::<usize>()
+    }
+
     /// Length of the longest word in the list (0 if empty).
     pub fn longest(&self) -> usize {
         self.by_len.iter().rposition(|l| l.n > 0).unwrap_or(0)

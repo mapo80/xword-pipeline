@@ -276,6 +276,15 @@ pub struct SolveConfig {
     /// check (used by [`solve_portfolio`] to stop the losing workers).
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub time_limit_s: f64,
+    /// Work budget in search nodes for the whole solve (0 = none). With a
+    /// node budget the search no longer depends on the machine's speed:
+    /// same puzzle, seed and budget give the same result (`time_limit_s`
+    /// stays a safety ceiling).
+    pub node_limit: u64,
+    /// Weight of a theme word when comparing fills: the best fill maximizes
+    /// mean + weight × theme words, the clean track maximizes weight × theme
+    /// words − weak entries (then mean). 0 = theme words don't count.
+    pub theme_weight: f64,
     /// Quality floors tried high→low. A floor of 50 forbids "questionable"
     /// (<50) entries; relaxing to 40 permits glue.
     pub tiers: Vec<u8>,
@@ -332,6 +341,8 @@ pub const SOLVER_FLAGS: &[&str] = &[
     "--parallel",
     "--pangram",
     "--pangram-alphabet",
+    "--node-limit",
+    "--theme-weight",
 ];
 
 impl SolveConfig {
@@ -415,6 +426,22 @@ impl SolveConfig {
                         .map_err(|_| format!("bad --pangram '{v}' (use a count, 0 = off)"))?;
                     i += 1;
                 }
+                "--node-limit" => {
+                    let v = value()?;
+                    self.node_limit = v
+                        .parse()
+                        .map_err(|_| format!("bad --node-limit '{v}' (use a number, 0 = off)"))?;
+                    i += 1;
+                }
+                "--theme-weight" => {
+                    let v = value()?;
+                    self.theme_weight = v
+                        .parse()
+                        .ok()
+                        .filter(|w: &f64| *w >= 0.0 && w.is_finite())
+                        .ok_or(format!("bad --theme-weight '{v}' (use a number >= 0)"))?;
+                    i += 1;
+                }
                 "--pangram-alphabet" => {
                     self.pangram_alphabet = value()?.to_ascii_uppercase();
                     i += 1;
@@ -486,6 +513,16 @@ impl SolveConfig {
             } else {
                 String::new()
             } + if self.exhaustive { ", exhaustive" } else { "" }
+            + &if self.node_limit > 0 {
+                format!(", node-limit {}", self.node_limit)
+            } else {
+                String::new()
+            }
+            + &if self.theme_weight > 0.0 {
+                format!(", theme-weight {}", self.theme_weight)
+            } else {
+                String::new()
+            }
     }
 }
 
@@ -562,23 +599,23 @@ pub fn solve_portfolio(
             .collect()
     });
     Ok(if split.is_some() {
-        merge_split_results(results)
+        merge_split_results(results, cfg.theme_weight)
     } else {
-        merge_results(results)
+        merge_results(results, cfg.theme_weight)
     })
 }
 
 /// Merge for split mode: the grid is unfillable only if every part is.
-fn merge_split_results(results: Vec<SolveResult>) -> SolveResult {
+fn merge_split_results(results: Vec<SolveResult>, theme_weight: f64) -> SolveResult {
     let all = results.iter().all(|r| r.proven_unfillable);
-    let mut r = merge_results(results);
+    let mut r = merge_results(results, theme_weight);
     r.proven_unfillable = all && r.reason != "solved";
     r
 }
 
 /// Combine worker results: best fill by mean, best clean alternative from any
 /// worker, summed node/restart counts, proof of unfillability from any.
-fn merge_results(results: Vec<SolveResult>) -> SolveResult {
+fn merge_results(results: Vec<SolveResult>, theme_weight: f64) -> SolveResult {
     let proven = results.iter().any(|r| r.proven_unfillable);
     let mut total_nodes = 0u64;
     let mut total_restarts = 0u64;
@@ -590,17 +627,21 @@ fn merge_results(results: Vec<SolveResult>) -> SolveResult {
         if let Some(c) = &res.clean {
             if best_clean
                 .as_ref()
-                .is_none_or(|b| Solver::better_clean(c, b))
+                .is_none_or(|b| Solver::better_clean(c, b, theme_weight))
             {
                 best_clean = Some(c.clone());
             }
         }
+        // objective of a primary fill: mean + weight × theme words
+        let objective = |r: &SolveResult| {
+            r.mean_score
+                .map(|m| m + theme_weight * r.theme_count as f64)
+        };
         let take = match &best {
             None => true,
             Some(b) => {
                 res.reason == "solved"
-                    && b.mean_score
-                        .is_none_or(|bm| res.mean_score.is_some_and(|m| m > bm))
+                    && objective(b).is_none_or(|bm| objective(&res).is_some_and(|m| m > bm))
             }
         };
         if take {
@@ -640,6 +681,9 @@ pub struct Suggestions {
 /// either succeed almost immediately or are infeasible.
 const REPAIR_TIME_FRAC: f64 = 0.15;
 
+/// Smallest node budget of a repair step under a node budget.
+const MIN_REPAIR_NODES: u64 = 200;
+
 impl Default for SolveConfig {
     fn default() -> Self {
         SolveConfig {
@@ -662,6 +706,8 @@ impl Default for SolveConfig {
             theme: Default::default(),
             cancel: None,
             time_limit_s: 30.0,
+            node_limit: 0,
+            theme_weight: 0.0,
             // Clue-count scores: 1 clue → 50, 2 → 58, 3 → 63. Secure any fill
             // first, then hunt fills of better-known words.
             tiers: vec![50, 58, 63],
@@ -690,6 +736,9 @@ pub struct SolvedFill {
     /// tail an editor would count. 0 when the bar is disabled.
     pub weak_count: usize,
     pub fill: Vec<(usize, String, u8)>,
+    /// Answers of the fill (searched and locked) that are theme words (see
+    /// [`SolveConfig::theme`]).
+    pub theme_count: usize,
 }
 
 #[derive(Clone)]
@@ -713,6 +762,8 @@ pub struct SolveResult {
     /// The search explored everything and found no fill: the grid is
     /// unfillable with this word list (at the lowest quality floor).
     pub proven_unfillable: bool,
+    /// Theme words in the primary fill (0 when unsolved).
+    pub theme_count: usize,
 }
 
 /// A domain snapshot taken before an entry's domain is changed.
@@ -766,6 +817,12 @@ pub struct Solver<'a> {
     nodes: u64,
     attempt_budget: u64,
     deadline: Instant,
+    /// node budget: the attempt stops when `work_base + nodes` reaches it
+    node_deadline: u64,
+    /// nodes spent by the earlier attempts of this solve
+    work_base: u64,
+    /// locked answers that are theme words
+    locked_theme: usize,
     floor: u8,
     cand_cap: usize,
     cand_ratio: usize,
@@ -919,6 +976,9 @@ impl<'a> Solver<'a> {
             nodes: 0,
             attempt_budget: u64::MAX,
             deadline: Instant::now(),
+            node_deadline: u64::MAX,
+            work_base: 0,
+            locked_theme: 0,
             floor: 0,
             cand_cap: defaults.cand_cap,
             cand_ratio: defaults.cand_ratio,
@@ -1251,8 +1311,23 @@ impl<'a> Solver<'a> {
         }
         self.cancel = cfg.cancel.clone();
         self.rng = Rng::new(cfg.seed);
+        self.locked_theme = if self.theme.is_empty() {
+            0
+        } else {
+            self.locked_used
+                .iter()
+                .filter(|lw| self.theme.contains(lw))
+                .count()
+        };
         let t0 = Instant::now();
         let global_deadline = t0 + std::time::Duration::from_secs_f64(cfg.time_limit_s);
+        // node budget for the whole solve (u64::MAX = none)
+        let node_cap = if cfg.node_limit > 0 {
+            cfg.node_limit
+        } else {
+            u64::MAX
+        };
+        self.node_deadline = node_cap;
 
         let mut best: Option<SolvedFill> = None;
         let mut clean: Option<SolvedFill> = None;
@@ -1302,6 +1377,7 @@ impl<'a> Solver<'a> {
                 fill: None,
                 clean: None,
                 proven_unfillable: true,
+                theme_count: 0,
             };
         }
 
@@ -1311,6 +1387,7 @@ impl<'a> Solver<'a> {
         if cfg.exhaustive {
             restarts += 1;
             let seed = self.rng.next_u64();
+            self.work_base = total_nodes;
             let outcome = self.attempt(lowest, u64::MAX, seed, global_deadline);
             total_nodes += self.nodes;
             match outcome {
@@ -1322,9 +1399,15 @@ impl<'a> Solver<'a> {
 
         // Phase 1 — feasibility: restart at the lowest floor until first solve.
         let mut budget = cfg.initial_budget;
-        while !proven && Instant::now() < global_deadline && best.is_none() && !self.cancelled() {
+        while !proven
+            && Instant::now() < global_deadline
+            && total_nodes < node_cap
+            && best.is_none()
+            && !self.cancelled()
+        {
             restarts += 1;
             let seed = self.rng.next_u64();
+            self.work_base = total_nodes;
             let outcome = self.attempt(lowest, budget, seed, global_deadline);
             total_nodes += self.nodes;
             if outcome == Outcome::Solved {
@@ -1353,14 +1436,30 @@ impl<'a> Solver<'a> {
                 .filter(|&f| cfg.clean_floor > 0 && f >= cfg.clean_floor && f > lowest)
                 .collect();
             let hunt_start = Instant::now();
-            if !hunt_floors.is_empty() && hunt_start < global_deadline && clean.is_none() {
+            let hunt_work = total_nodes;
+            if !hunt_floors.is_empty()
+                && hunt_start < global_deadline
+                && hunt_work < node_cap
+                && clean.is_none()
+            {
                 let slice = (global_deadline - hunt_start) / (2 * hunt_floors.len() as u32);
+                let node_slice = (node_cap - hunt_work) / (2 * hunt_floors.len() as u64);
                 'hunt: for (i, &floor) in hunt_floors.iter().enumerate() {
                     let tier_deadline = (hunt_start + slice * (i as u32 + 1)).min(global_deadline);
+                    let tier_nodes = if node_cap == u64::MAX {
+                        u64::MAX
+                    } else {
+                        hunt_work + node_slice * (i as u64 + 1)
+                    };
                     budget = cfg.initial_budget;
-                    while Instant::now() < tier_deadline && !self.cancelled() {
+                    while Instant::now() < tier_deadline
+                        && total_nodes < tier_nodes
+                        && !self.cancelled()
+                    {
                         restarts += 1;
                         let seed = self.rng.next_u64();
+                        self.work_base = total_nodes;
+                        self.node_deadline = tier_nodes;
                         let outcome = self.attempt(floor, budget, seed, tier_deadline);
                         total_nodes += self.nodes;
                         if outcome == Outcome::Solved {
@@ -1384,11 +1483,13 @@ impl<'a> Solver<'a> {
             polish_floors.sort_unstable_by(|a, b| b.cmp(a)); // desc
             let mut idx = 0usize;
             budget = cfg.initial_budget;
-            while Instant::now() < global_deadline && !self.cancelled() {
+            self.node_deadline = node_cap;
+            while Instant::now() < global_deadline && total_nodes < node_cap && !self.cancelled() {
                 let floor = polish_floors[idx % polish_floors.len()];
                 idx += 1;
                 restarts += 1;
                 let seed = self.rng.next_u64();
+                self.work_base = total_nodes;
                 let outcome = self.attempt(floor, budget, seed, global_deadline);
                 total_nodes += self.nodes;
                 if outcome == Outcome::Solved {
@@ -1423,6 +1524,7 @@ impl<'a> Solver<'a> {
                     min_score,
                     weak_count,
                     fill,
+                    theme_count,
                 } = b;
                 SolveResult {
                     letters: Some(letters),
@@ -1436,6 +1538,7 @@ impl<'a> Solver<'a> {
                     fill: Some(fill),
                     clean,
                     proven_unfillable: false,
+                    theme_count,
                 }
             }
             None => SolveResult {
@@ -1450,15 +1553,25 @@ impl<'a> Solver<'a> {
                 fill: None,
                 clean: None,
                 proven_unfillable: proven,
+                theme_count: 0,
             },
         }
     }
 
-    /// Clean-track ordering: fewest weak (sub-`weak_bar`) entries first, mean
-    /// as the tie-break. With the bar disabled both counts are 0 and this
-    /// degenerates to pure mean.
-    fn better_clean(a: &SolvedFill, b: &SolvedFill) -> bool {
-        a.weak_count < b.weak_count || (a.weak_count == b.weak_count && a.mean_score > b.mean_score)
+    /// Clean-track ordering: highest `theme_weight` × theme words − weak
+    /// (sub-`weak_bar`) entries first, mean as the tie-break. Without a
+    /// weight this is fewest weak entries, then mean; with the bar disabled
+    /// too it degenerates to pure mean.
+    fn better_clean(a: &SolvedFill, b: &SolvedFill, theme_weight: f64) -> bool {
+        let key = |f: &SolvedFill| theme_weight * f.theme_count as f64 - f.weak_count as f64;
+        let (ka, kb) = (key(a), key(b));
+        ka > kb || (ka == kb && a.mean_score > b.mean_score)
+    }
+
+    /// Objective of the primary (best) fill: mean + `theme_weight` × theme
+    /// words.
+    fn objective(f: &SolvedFill, theme_weight: f64) -> f64 {
+        f.mean_score + theme_weight * f.theme_count as f64
     }
 
     /// Fold the just-solved fill into the running bests: overall (highest
@@ -1473,11 +1586,17 @@ impl<'a> Solver<'a> {
         let s = self.snapshot_solution(cfg.weak_bar);
         if cfg.clean_floor > 0
             && s.min_score >= cfg.clean_floor
-            && clean.as_ref().is_none_or(|c| Self::better_clean(&s, c))
+            && clean
+                .as_ref()
+                .is_none_or(|c| Self::better_clean(&s, c, cfg.theme_weight))
         {
             *clean = Some(s.clone());
         }
-        if best.as_ref().is_none_or(|b| s.mean_score > b.mean_score) {
+        let w = cfg.theme_weight;
+        if best
+            .as_ref()
+            .is_none_or(|b| Self::objective(&s, w) > Self::objective(b, w))
+        {
             *best = Some(s);
         }
     }
@@ -1488,6 +1607,7 @@ impl<'a> Solver<'a> {
         let mut total = 0u32;
         let mut min_s = 100u8;
         let mut weak = 0usize;
+        let mut theme = self.locked_theme;
         let mut fill = Vec::with_capacity(self.p.entries.len());
         for ei in 0..self.p.entries.len() {
             if self.is_locked[ei] {
@@ -1500,6 +1620,9 @@ impl<'a> Solver<'a> {
             min_s = min_s.min(sc);
             if weak_bar > 0 && sc < weak_bar {
                 weak += 1;
+            }
+            if self.theme.contains(&(self.p.entries[ei].len, w)) {
+                theme += 1;
             }
             fill.push((ei, self.wl.word(self.p.entries[ei].len, w), sc));
         }
@@ -1514,7 +1637,27 @@ impl<'a> Solver<'a> {
             fill,
             min_score: if self.n_searchable == 0 { 100 } else { min_s },
             weak_count: weak,
+            theme_count: theme,
         }
+    }
+
+    /// Theme words among the answers of `fill` (by dictionary lookup).
+    fn count_theme(&self, fill: &[(usize, String, u8)]) -> usize {
+        if self.theme.is_empty() {
+            return 0;
+        }
+        fill.iter()
+            .filter(|(ei, ans, _)| {
+                let len = self.p.entries[*ei].len;
+                let letters: Vec<u8> = ans.bytes().map(|b| b.wrapping_sub(b'A')).collect();
+                letters.len() == len
+                    && self
+                        .wl
+                        .len_data(len)
+                        .index_of(&letters)
+                        .is_some_and(|w| self.theme.contains(&(len, w)))
+            })
+            .count()
     }
 
     /// Try to repair both the mean-best and the clean-best fill; keep a repair
@@ -1528,7 +1671,10 @@ impl<'a> Solver<'a> {
         let targets: Vec<SolvedFill> = best.iter().chain(clean.iter()).cloned().collect();
         for t in targets {
             if let Some(rep) = self.repair(&t, cfg) {
-                if clean.as_ref().is_none_or(|c| Self::better_clean(&rep, c)) {
+                if clean
+                    .as_ref()
+                    .is_none_or(|c| Self::better_clean(&rep, c, cfg.theme_weight))
+                {
                     *clean = Some(rep);
                 }
             }
@@ -1564,16 +1710,25 @@ impl<'a> Solver<'a> {
         }
         weak.sort_unstable();
         let slice = (cfg.time_limit_s * REPAIR_TIME_FRAC).max(0.05);
+        // with a node budget the repair gets the same fraction of it
+        let slice_nodes = match cfg.node_limit {
+            0 => 0,
+            n => ((n as f64 * REPAIR_TIME_FRAC) as u64).max(MIN_REPAIR_NODES),
+        };
         // 1) all weak entries at once, when few enough
         if weak.len() <= cfg.repair_max_weak {
             let targets: Vec<usize> = weak.iter().map(|&(_, e)| e).collect();
-            if let Some(r) = self.repair_region(b, cfg, &targets, 1, slice) {
+            if let Some(r) = self.repair_region(b, cfg, &targets, 1, (slice, slice_nodes)) {
                 return Some(r);
             }
         }
         // 2) greedy: one weak entry (plus its crossings) at a time, keeping
         //    each refill that leaves fewer weak entries
         let step = (slice / weak.len() as f64).max(0.05);
+        let step_nodes = match slice_nodes {
+            0 => 0,
+            n => (n / weak.len() as u64).max(MIN_REPAIR_NODES),
+        };
         let mut cur = b.clone();
         let mut improved = false;
         for &(_, ei) in &weak {
@@ -1583,8 +1738,8 @@ impl<'a> Solver<'a> {
             }
             // radius 2: in dense grids a weak word plus its crossings is
             // pinned by the words around it; the second ring frees it
-            if let Some(r) = self.repair_region(&cur, cfg, &[ei], 2, step) {
-                if Self::better_clean(&r, &cur) {
+            if let Some(r) = self.repair_region(&cur, cfg, &[ei], 2, (step, step_nodes)) {
+                if Self::better_clean(&r, &cur, cfg.theme_weight) {
                     cur = r;
                     improved = true;
                 }
@@ -1602,7 +1757,7 @@ impl<'a> Solver<'a> {
         cfg: &SolveConfig,
         targets: &[usize],
         radius: usize,
-        time_s: f64,
+        budget: (f64, u64),
     ) -> Option<SolvedFill> {
         let n = self.p.entries.len();
         // Region: the targets plus every searched entry within `radius`
@@ -1654,7 +1809,7 @@ impl<'a> Solver<'a> {
         };
         floors
             .into_iter()
-            .find_map(|floor| self.resolve_region(cfg, &locks, floor, time_s))
+            .find_map(|floor| self.resolve_region(cfg, &locks, floor, budget))
     }
 
     /// Re-solve the entries not covered by `locks` with words scoring at
@@ -1664,7 +1819,7 @@ impl<'a> Solver<'a> {
         cfg: &SolveConfig,
         locks: &[Lock],
         floor: u8,
-        time_s: f64,
+        (time_s, node_limit): (f64, u64),
     ) -> Option<SolvedFill> {
         let n = self.p.entries.len();
         let mut inner = Solver::with_locks(self.p, self.wl, locks).ok()?;
@@ -1696,6 +1851,8 @@ impl<'a> Solver<'a> {
             free_rebus: cfg.free_rebus.clone(),
             theme: cfg.theme.clone(),
             cancel: cfg.cancel.clone(),
+            node_limit,
+            theme_weight: cfg.theme_weight,
         });
         let letters = r.letters?;
         let inner_fill = r.fill?;
@@ -1739,6 +1896,7 @@ impl<'a> Solver<'a> {
             mean_score: total as f64 / ns as f64,
             min_score: if self.n_searchable == 0 { 100 } else { min_s },
             weak_count: weak_n,
+            theme_count: self.count_theme(&fill),
             fill,
         })
     }
@@ -1941,6 +2099,9 @@ impl<'a> Solver<'a> {
         self.nodes += 1;
         if self.nodes >= self.attempt_budget {
             return Outcome::Budget;
+        }
+        if self.work_base + self.nodes >= self.node_deadline {
+            return Outcome::TimeLimit;
         }
         if self.nodes & 15 == 0 && (Instant::now() >= self.deadline || self.cancelled()) {
             return Outcome::TimeLimit;
@@ -2751,6 +2912,7 @@ DOG;40
             mean_score: 475.0 / 6.0,
             min_score: 50,
             weak_count: 1, // ORE;50 under the default bar
+            theme_count: 0,
             fill,
         }
     }
@@ -2810,6 +2972,7 @@ DOG;40
             mean_score: 395.0 / 5.0,
             min_score: 50,
             weak_count: 1, // ORE;50 under the default bar
+            theme_count: 0,
             fill: vec![
                 (e(1, 0, Dir::Across), "ORE".to_string(), 50),
                 (e(2, 0, Dir::Across), "TEN".to_string(), 75),
@@ -3671,6 +3834,7 @@ DOG;40
             mean_score: total as f64 / fill.len() as f64,
             min_score: 50,
             weak_count: 2,
+            theme_count: 0,
             fill,
         };
         let s = Solver::new(&p, &wl);
@@ -3710,18 +3874,19 @@ DOG;40
             mean_score: 405.0 / 6.0,
             min_score: 55,
             weak_count: 1,
+            theme_count: 0,
             fill,
         };
         let s = Solver::new(&p, &wl);
         let cfg = SolveConfig::default();
         let ben = e(0, 2, Dir::Down);
-        let r1 = s.repair_region(&b, &cfg, &[ben], 1, 0.5);
+        let r1 = s.repair_region(&b, &cfg, &[ben], 1, (0.5, 0));
         assert!(
             r1.is_none_or(|r| r.weak_count == 1),
             "radius 1 cannot drop BEN"
         );
         let r2 = s
-            .repair_region(&b, &cfg, &[ben], 2, 0.5)
+            .repair_region(&b, &cfg, &[ben], 2, (0.5, 0))
             .expect("radius 2 refills");
         assert_eq!(r2.weak_count, 0);
     }
@@ -3801,7 +3966,7 @@ DOG;40
             proven_unfillable: false,
             ..Solver::new(&p, &wl).solve(&cfg)
         };
-        let merged = merge_results(vec![unproven, proven]);
+        let merged = merge_results(vec![unproven, proven], 0.0);
         assert!(merged.proven_unfillable);
     }
 
@@ -4304,8 +4469,8 @@ DOG;40
             proven_unfillable: false,
             ..proven.clone()
         };
-        assert!(!merge_split_results(vec![proven.clone(), open]).proven_unfillable);
-        assert!(merge_split_results(vec![proven.clone(), proven]).proven_unfillable);
+        assert!(!merge_split_results(vec![proven.clone(), open], 0.0).proven_unfillable);
+        assert!(merge_split_results(vec![proven.clone(), proven], 0.0).proven_unfillable);
     }
 
     #[test]
@@ -4513,5 +4678,139 @@ DOG;40
             answer: "CAB".into(),
         }];
         assert!(Solver::with_locks(&p, &wl, &bad).is_err());
+    }
+
+    // ---- fase 3: budget a nodi, peso del tema ----
+
+    /// Every 2..=5-letter string over six letters (scores vary by the first
+    /// letter so the quality search has something to improve).
+    fn synth_wl() -> Wordlist {
+        let alpha = ['A', 'E', 'I', 'O', 'R', 'S'];
+        let mut words: Vec<String> = alpha.iter().map(|c| c.to_string()).collect();
+        let mut src = String::new();
+        for _ in 2..=5 {
+            words = words
+                .iter()
+                .flat_map(|w| alpha.iter().map(move |c| format!("{w}{c}")))
+                .collect();
+            for (i, w) in words.iter().enumerate() {
+                src.push_str(&format!("{w};{}\n", 40 + (i * 7) % 51));
+            }
+        }
+        Wordlist::from_str(&src, 0)
+    }
+
+    /// A node budget ends the quality search after that much work, whatever
+    /// the time limit, and makes the result repeatable.
+    #[test]
+    fn node_limit_bounds_work_and_repeats_exactly() {
+        let wl = synth_wl();
+        let p = Puzzle::from_template(".....\n.....\n..#..\n.....\n.....\n");
+        let cfg = SolveConfig {
+            time_limit_s: 3.0,
+            node_limit: 3_000,
+            seed: 11,
+            ..Default::default()
+        };
+        let a = Solver::new(&p, &wl).solve(&cfg);
+        let b = Solver::new(&p, &wl).solve(&cfg);
+        assert_eq!(a.reason, "solved");
+        assert!(
+            a.elapsed_s < 1.5,
+            "stopped by the node budget: {}",
+            a.elapsed_s
+        );
+        assert!(a.nodes <= 3_000, "nodes {}", a.nodes);
+        assert_eq!(a.nodes, b.nodes);
+        assert_eq!(a.restarts, b.restarts);
+        assert_eq!(a.fill, b.fill);
+        let words = |r: &SolveResult| r.clean.as_ref().map(|c| c.fill.clone());
+        assert_eq!(words(&a), words(&b));
+    }
+
+    /// With a theme weight the clean track keeps a theme word that costs a
+    /// weak entry, and a large weight makes it the best fill too.
+    #[test]
+    fn theme_weight_keeps_theme_words_in_the_published_fill() {
+        let p = Puzzle::from_template("...\n");
+        let wl = Wordlist::from_str("AAA;90\nCCC;55\n", 0);
+        let ccc = wl.len_data(3).index_of(&[2, 2, 2]).unwrap();
+        let theme = std::sync::Arc::new([(3usize, ccc)].into_iter().collect());
+        let cfg = |w: f64| SolveConfig {
+            time_limit_s: 0.3,
+            optimize: Optimize::Theme,
+            theme: std::sync::Arc::clone(&theme),
+            theme_weight: w,
+            ..Default::default()
+        };
+        let answer = |f: &SolvedFill| f.fill[0].1.clone();
+        let r = Solver::new(&p, &wl).solve(&cfg(0.0));
+        assert_eq!(
+            answer(r.clean.as_ref().unwrap()),
+            "AAA",
+            "no weight: fewer weak"
+        );
+        let r = Solver::new(&p, &wl).solve(&cfg(2.0));
+        let clean = r.clean.as_ref().unwrap();
+        assert_eq!(
+            answer(clean),
+            "CCC",
+            "weight 2: theme word beats a weak entry"
+        );
+        assert_eq!(clean.theme_count, 1);
+        assert_eq!(r.fill.as_ref().unwrap()[0].1, "AAA", "mean 90 > 55 + 2");
+        let r = Solver::new(&p, &wl).solve(&cfg(50.0));
+        assert_eq!(r.fill.as_ref().unwrap()[0].1, "CCC", "55 + 50 > 90");
+    }
+
+    /// The parallel merge compares fills with the same theme weight.
+    #[test]
+    fn merge_uses_theme_weight() {
+        let fill = |ans: &str, mean: f64, weak: usize, theme: usize| SolvedFill {
+            letters: Vec::new(),
+            mean_score: mean,
+            min_score: 50,
+            weak_count: weak,
+            fill: vec![(0, ans.to_string(), mean as u8)],
+            theme_count: theme,
+        };
+        let res = |f: SolvedFill| SolveResult {
+            letters: Some(Vec::new()),
+            nodes: 1,
+            restarts: 1,
+            elapsed_s: 0.0,
+            reason: "solved",
+            mean_score: Some(f.mean_score),
+            min_score: Some(50),
+            weak_count: Some(f.weak_count),
+            fill: Some(f.fill.clone()),
+            theme_count: f.theme_count,
+            clean: Some(f),
+            proven_unfillable: false,
+        };
+        let a = || res(fill("AAA", 90.0, 0, 0));
+        let c = || res(fill("CCC", 55.0, 1, 1));
+        let m = merge_results(vec![a(), c()], 0.0);
+        assert_eq!(m.clean.unwrap().fill[0].1, "AAA");
+        let m = merge_results(vec![a(), c()], 2.0);
+        assert_eq!(m.clean.unwrap().fill[0].1, "CCC");
+        let m = merge_results(vec![a(), c()], 50.0);
+        assert_eq!(m.fill.unwrap()[0].1, "CCC");
+    }
+
+    #[test]
+    fn node_limit_and_theme_weight_options() {
+        let args: Vec<String> = ["--node-limit", "5000", "--theme-weight", "1.5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cfg = SolveConfig::default().with_args(&args).unwrap();
+        assert_eq!((cfg.node_limit, cfg.theme_weight), (5000, 1.5));
+        assert!(cfg.describe().contains("node-limit 5000"));
+        assert!(cfg.describe().contains("theme-weight 1.5"));
+        for bad in [["--node-limit", "x"], ["--theme-weight", "-1"]] {
+            let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(SolveConfig::default().with_args(&args).is_err());
+        }
     }
 }

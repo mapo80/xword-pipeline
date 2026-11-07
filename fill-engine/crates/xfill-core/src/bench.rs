@@ -339,6 +339,7 @@ mod tests {
             mean_score: 75.0,
             min_score: 60,
             weak_count: 0,
+            theme_count: 0,
             fill: Vec::new(),
         };
         let r = SolveResult {
@@ -353,6 +354,7 @@ mod tests {
             fill: Some(Vec::new()),
             clean: Some(clean),
             proven_unfillable: false,
+            theme_count: 0,
         };
         let c = result_of("x", &r);
         assert_eq!((c.mean, c.weak), (Some(75.0), Some(0)));

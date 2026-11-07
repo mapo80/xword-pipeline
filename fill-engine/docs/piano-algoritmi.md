@@ -102,6 +102,31 @@ Copertura righe 76,6% → **96,4%** (funzioni 98,7%); 88 test unitari + 14 d'int
   copre la stessa esigenza dentro un tentativo, in modo dimostrabilmente
   corretto.
 
+## Fase 3: libreria, FFI, SDK
+
+Il motore diventa una libreria usata da altri programmi: un'API in
+`xfill-core` (`api`), un'interfaccia C (`xfill-ffi`, JSON in/out) e un SDK
+.NET (`dotnet/Cruciverba.Xfill`) distribuito come pacchetto NuGet.
+
+| # | Aspetto | Tipo | Default | Stato |
+|---|---|---|---|---|
+| 27 | Budget di lavoro in nodi per tutto il `solve` (fasi, caccia al pulito e riparazione divise in nodi invece che in secondi): stesso schema + seme + budget ⇒ stesso risultato su qualunque macchina | `node_limit` (`--node-limit N`) | **0** nei comandi (tempo); **5.000** nell'API | ☑ |
+| 28 | Peso del tema nel confronto tra riempimenti (migliore = media + p × parole a tema; traccia pulita = p × tema − deboli, poi media) e nella scelta tra schemi | `theme_weight` (`--theme-weight W`) | 0 nei comandi; vedi punto 31 nell'API | ☑ |
+| 29 | Modulo `api`: `generate(&Dictionary, &GenerateRequest, &CancelFlag) -> GenerateResult` (schemi, riempimento parallelo deterministico, scelta, numerazione, definizioni), `validate`, richiesta e risultato serde (contratto JSON della FFI); il binario `library` lo usa | API | sempre attivo | ☑ |
+| 30 | Interfaccia C `xfill-ffi` (cdylib `xfill`), header cbindgen, nessun panic oltre il confine | API | — | ☐ |
+| 31 | Densità del tema: misura nel benchmark, ordine dei candidati, schemi costruiti intorno alle parole a tema | vedi registro | dal benchmark | ☐ |
+| 32 | SDK .NET `Cruciverba.Xfill` (LibraryImport, SafeHandle, async + cancellazione, OpenTelemetry) e pacchetto NuGet per 6 RID | SDK | — | ☐ |
+| 33 | Workflow `nuget.yml` (matrice 6 RID, test .NET su Windows/Linux/macOS, pubblicazione al tag `xfill-v*`) e soglie di copertura in CI | CI | — | ☐ |
+
+**Determinismo con più thread.** Ogni schema ha un seme fisso (dalla
+sequenza del seme della richiesta) e, con un budget in nodi, un risultato che
+non dipende dalla velocità. I thread prendono gli schemi in ordine; ci si
+ferma quando gli schemi *finiti dall'inizio senza buchi* contengono già
+`pool` griglie buone, e i risultati degli schemi oltre quel punto si
+scartano. L'esito è quindi lo stesso con 1 o N thread. Il limite di tempo per
+schema resta un tetto di sicurezza: se scatta, il determinismo non è più
+garantito.
+
 ## Registro
 
 | Data | Punto | Cosa |
@@ -151,3 +176,7 @@ Copertura righe 76,6% → **96,4%** (funzioni 98,7%); 88 test unitari + 14 d'int
 | 2026-11-07 | 24 | Rossi (2 core + 1 integrazione): sintassi dei pattern (`?`, `*`, `@`, `#`, `[..]`, `[^..]`, maiuscole/minuscole, classe non chiusa = errore, ordine per punteggio), anagrammi di una parola, di più parole (CASA ROMA da CASAROMA) e con jolly (RO?A → ROMA, ROSA); binario `parole pattern|anagram` con `--clues`, `--words`, `--limit`. Verde: modulo `words` (`find_pattern`: pattern compilato in insiemi di lettere, `*` con ritorno indietro, solo la lunghezza giusta se non c'è `*`; `anagrams`: ricerca sui conteggi delle lettere, jolly per le mancanti, parole in ordine fisso per non ripetere permutazioni). Su Db.csv: `?A?A` → 77 parole, anagrammi di ROMANO in 2 parole in 0,04 s. |
 | 2026-11-07 | 25 | Rossi (5 core + 1 integrazione): almeno 3 parole da 7 in un 9×9, nessuna parola a tutta riga, lunghezze richieste (8, 8, 6), rettangolo bianco massimo (calcolo su caso noto = 6 e vincolo ≤ 12), reticolo di nere nelle caselle (dispari, dispari); opzioni di `library` e loro errori. Verde: `ItGenConfig { min_len_counts, max_full_words, require_lengths, max_white_rect, lattice }` verificati sul pattern completo (`complete_ok`, usata anche dalla forza bruta del test di completezza, che resta verde), `max_white_rect` con istogramma e pila per riga, schema iniziale a reticolo con i partner di simmetria; `library --min-len-count L:N,… --require-lengths … --max-full-words N --max-white-rect A --lattice`. |
 | 2026-11-07 | 26 | Rossi (7 core + 1 integrazione, senza rete): configurazione da file (riga 1 URL, riga 2 chiave; endpoint `/chat/completions` aggiunto se manca), prompt italiano nostro, corpo JSON con escape, estrazione del contenuto o dell'errore (anche `\uXXXX`), parsing delle righe "PAROLA: definizione" (scarta parole non richieste e definizioni che contengono la risposta), riempimento delle sole mancanti o di tutte tramite un fornitore finto, configurazione di `curl` con la chiave su stdin; `library` valida subito le opzioni. Verde: modulo `llm` (`LlmConfig`, `ClueProvider`, `CurlClient` via `curl --config -`, `fill_clues`); `library --llm-clues off\|missing\|all --llm-config FILE (default ../../.alibaba) --llm-model (default qwen3.8-flash)`; in caso di errore restano le definizioni del database. **Prova reale** (Alibaba, qwen3.8-flash): 12 definizioni per un 5×5, ~110 s di risposta → timeout portato a 300 s. Nel sandbox degli strumenti l'host è bloccato; dal terminale dell'utente no. |
+| 2026-11-07 | — | Toolchain Rust 1.95.0 → **1.99.1** (stable più recente); test e clippy invariati (143 + 24 verdi). |
+| 2026-11-07 | 27 | Rosso: con `node_limit` 3.000 e 3 s di tempo il solve durava 3 s (il budget non c'era). Verde: scadenza in nodi accanto a quella in tempo (`work_base + nodes`), fette in nodi per la caccia al pulito e il 15% del budget per la riparazione; due solve uguali danno stessi nodi, riavvii e riempimento. Opzione `--node-limit N` (test rosso → verde). Benchmark quality (tetto 30 s): 5.000 nodi **25/30 · 73,5 · deboli 3,5**, mediana 1,2 s; 15.000 25/30 · 73,6 · 3,5 (4,0 s); 40.000 25/30 · 73,8 · 3,3 (10,4 s); a tempo (2 s) 24/30 · 73,8 · 2,7. **Default API: 5.000**; i comandi restano a tempo. |
+| 2026-11-07 | 28 | Rossi (3): con `AAA;90` e `CCC;55` a tema, peso 2 → traccia pulita CCC (1 parola a tema vale più di 1 debole), peso 50 → migliore CCC (55 + 50 > 90), peso 0 → AAA come prima; stesso confronto nella fusione dei risultati paralleli. Verde: `SolvedFill::theme_count`, `SolveResult::theme_count`, `better_clean`/obiettivo pesati, conteggio anche dopo la riparazione. Opzione `--theme-weight W` (test rosso → verde). Scelta tra schemi (`select_keepers`) con la stessa chiave: test e codice scritti insieme (estensione della chiave esistente, a peso 0 identica). |
+| 2026-11-07 | 29 | Rossi (10): dizionario da byte CSV con memoria stimata; richiesta JSON con default e campi sconosciuti rifiutati; griglia rettangolare 6 righe × 9 colonne coerente e valida; **stesso seme ⇒ stesso risultato con 1 e 4 thread**; parole a tema contate e marcate; **annullamento entro 500 ms** (e subito se il flag è già alzato); richieste non valide e schemi impossibili; `validate` su griglia corretta e su ogni tipo di errore (numerazione, risposta ≠ griglia, incrocio in conflitto, voce mancante/duplicata, coordinate, slot inesistente, dimensioni, casella non valida, definizione che contiene la risposta, parole ripetute; ripetizioni di 2 lettere e definizioni mancanti come avvisi). Verde: modulo `api` (`Dictionary`, `Plan`, `generate_patterns`, `fill_patterns` con arresto sul prefisso, `assign_clues`, `plan_for`, `generate`, `validate`); `library` usa `generate_patterns`/`fill_patterns`/`assign_clues` (24 test d'integrazione verdi). Dipendenze nuove: serde 1.0.229, serde_json 1.0.154 (ultime stabili su crates.io). |

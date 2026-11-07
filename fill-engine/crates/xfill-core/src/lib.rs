@@ -8,6 +8,7 @@
 //! - [`solver`]: DFS solver (MRV + score order + restarts)
 //! - [`library`]: keeper selection + JSON artifact
 
+pub mod api;
 pub mod bench;
 pub mod bitset;
 pub mod clues;

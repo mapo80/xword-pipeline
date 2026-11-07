@@ -28,6 +28,11 @@ impl Bitset {
         Bitset { words, nbits }
     }
 
+    /// Heap memory of the bit storage (bytes).
+    pub fn heap_bytes(&self) -> usize {
+        self.words.len() * std::mem::size_of::<u64>()
+    }
+
     #[inline]
     pub fn nbits(&self) -> usize {
         self.nbits

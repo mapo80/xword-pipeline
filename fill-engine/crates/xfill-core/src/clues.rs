@@ -26,6 +26,21 @@ impl ClueDb {
     pub fn is_empty(&self) -> bool {
         self.clues.is_empty()
     }
+
+    /// Approximate heap memory held by the clues (bytes).
+    pub fn heap_bytes(&self) -> usize {
+        let string = std::mem::size_of::<String>();
+        self.clues
+            .iter()
+            .map(|(k, v)| {
+                k.capacity()
+                    + string
+                    + std::mem::size_of::<Vec<String>>()
+                    + v.iter().map(|c| c.capacity() + string).sum::<usize>()
+            })
+            .sum::<usize>()
+            + self.clues.capacity() * std::mem::size_of::<usize>()
+    }
 }
 
 impl ClueDb {
@@ -243,11 +258,22 @@ pub fn load_clue_csv_rebus(
     rebus: &[String],
 ) -> std::io::Result<(Wordlist, ClueDb)> {
     let bytes = fs::read(path)?;
-    let clues = parse_clue_csv(&bytes);
     let blocklist = blocklist_beside(path);
     if !blocklist.is_empty() {
         eprintln!("blocklist: excluding {} word(s)", blocklist.len());
     }
+    Ok(dictionary_from_csv(&bytes, min_score, &blocklist, rebus))
+}
+
+/// Build the fill wordlist and the clue database from `WORD,clue` CSV
+/// bytes already in memory (see [`load_clue_csv`]).
+pub fn dictionary_from_csv(
+    bytes: &[u8],
+    min_score: u8,
+    blocklist: &std::collections::HashSet<Box<[u8]>>,
+    rebus: &[String],
+) -> (Wordlist, ClueDb) {
+    let clues = parse_clue_csv(bytes);
     let mut dict = String::with_capacity(clues.len() * 12);
     let mut answers: Vec<&String> = clues.keys().collect();
     answers.sort();
@@ -257,8 +283,8 @@ pub fn load_clue_csv_rebus(
         dict.push_str(&score_from_clue_count(clues[a].len()).to_string());
         dict.push('\n');
     }
-    let wl = Wordlist::from_str_rebus(&dict, min_score, &blocklist, rebus);
-    Ok((wl, ClueDb { clues }))
+    let wl = Wordlist::from_str_rebus(&dict, min_score, blocklist, rebus);
+    (wl, ClueDb { clues })
 }
 
 #[cfg(test)]

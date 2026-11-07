@@ -16,15 +16,13 @@
 //! `--size` is ROWSxCOLS (e.g. `13x21`) or a single N for a square grid.
 //! `--blocks` defaults to ~15% of the cells.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::time::Instant;
+use xfill_core::api::{assign_clues, cancel_flag, fill_patterns, generate_patterns, Plan};
 use xfill_core::clues::load_clue_csv_rebus;
-use xfill_core::gen_it::{generate_it, GenMode, ItGenConfig, Symmetry};
-use xfill_core::library::{build_lib_grid, write_json, LibGrid};
-use xfill_core::util::Rng;
+use xfill_core::gen_it::{GenMode, ItGenConfig, Symmetry};
+use xfill_core::library::write_json;
 use xfill_core::wordlist::MAX_LEN;
-use xfill_core::{Puzzle, SolveConfig, Solver};
+use xfill_core::SolveConfig;
 
 fn arg<T: std::str::FromStr>(name: &str, default: T) -> T {
     let mut it = std::env::args().skip(1);
@@ -210,7 +208,7 @@ fn main() {
         flag("--max-white-rect").then(|| arg("--max-white-rect", usize::MAX));
     let lattice = flag("--lattice");
 
-    // Phase 1: generate candidate patterns + fixed per-grid seeds.
+    // Pattern generator constraints.
     let gen_cfg = ItGenConfig {
         symmetry,
         max_len,
@@ -233,98 +231,54 @@ fn main() {
         gen_cfg.max_white_rect,
         if gen_cfg.lattice { ", lattice" } else { "" }
     );
-    let mut rng = Rng::new(seed);
-    let mut jobs: Vec<(String, u64)> = Vec::with_capacity(candidates);
-    let mut tries = 0usize;
-    let mut seen = std::collections::HashSet::new();
-    let mut infeasible = 0usize;
-    let max_tries = candidates.saturating_mul(20).max(200);
-    while jobs.len() < candidates && tries < max_tries {
-        tries += 1;
-        let jseed = rng.next_u64();
-        let Some(tpl) = generate_it(&gen_cfg, &mut rng, 50) else {
-            continue;
-        };
-        let p = Puzzle::from_template_with_rebus(&tpl, &wl.rebus);
-        // every entry length must exist in the word list
-        if p.orphan_cells() > 0 || p.entries.iter().any(|e| wl.len_data(e.len).n == 0) {
-            continue;
-        }
-        if !seen.insert(tpl.clone()) {
-            continue;
-        }
-        // don't spend fill time on patterns the dictionary provably can't fill
-        if !Solver::new(&p, &wl).analyze().feasible {
-            infeasible += 1;
-            continue;
-        }
-        jobs.push((tpl, jseed));
-    }
+    // Phases 1-2 (pattern generation, parallel fill) live in the core API;
+    // workers stop once the library has plenty of keepers (2x what we'll
+    // output).
+    let plan = Plan {
+        gen: gen_cfg,
+        solve: SolveConfig {
+            time_limit_s: time,
+            weak_bar,
+            ..base_cfg.clone()
+        },
+        candidates,
+        min_mean: keep_mean,
+        max_weak,
+        stop_after: top * 2,
+        threads: workers,
+        seed,
+    };
+    let cancel = cancel_flag();
+    let patterns = generate_patterns(&wl, &plan, &cancel);
+    let jobs = patterns.jobs;
     if jobs.is_empty() {
         eprintln!(
             "error: could not generate any valid {rows}x{cols} pattern with {blocks} blacks \
-             after {tries} tries. Try more --blocks, --no-adjacent off, or a larger --max-len."
+             after {} tries. Try more --blocks, --no-adjacent off, or a larger --max-len.",
+            patterns.tries
         );
         std::process::exit(1);
     }
     eprintln!(
         "generated {} candidate {rows}x{cols} patterns ({blocks} blacks, symmetry {sym_s}, \
-         gen {gen_s}; {infeasible} infeasible skipped); filling with {workers} workers...",
-        jobs.len()
+         gen {gen_s}; {} infeasible skipped); filling with {workers} workers...",
+        jobs.len(),
+        patterns.infeasible
     );
 
-    // Phase 2: parallel fill; keep fills passing the gates. Workers stop early
-    // once the library has plenty of keepers (2x what we'll output).
-    let stop_at = top * 2;
-    let next = AtomicUsize::new(0);
-    let done = AtomicUsize::new(0);
-    let filled = AtomicUsize::new(0);
-    let kept: Mutex<Vec<LibGrid>> = Mutex::new(Vec::new());
-    let kept_count = AtomicUsize::new(0);
-    let t0 = Instant::now();
-
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| loop {
-                if kept_count.load(Ordering::Relaxed) >= stop_at {
-                    break;
-                }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= jobs.len() {
-                    break;
-                }
-                let (tpl, jseed) = &jobs[i];
-                let p = Puzzle::from_template_with_rebus(tpl, &wl.rebus);
-                let cfg = SolveConfig {
-                    time_limit_s: time,
-                    seed: *jseed,
-                    weak_bar,
-                    ..base_cfg.clone()
-                };
-                let r = Solver::new(&p, &wl).solve(&cfg);
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d.is_multiple_of(50) {
-                    eprintln!("  filled {d}/{} ...", jobs.len());
-                }
-                let Some(g) = build_lib_grid(&p, &r) else {
-                    continue;
-                };
-                filled.fetch_add(1, Ordering::Relaxed);
-                if g.mean < keep_mean || g.weak > max_weak {
-                    continue;
-                }
-                kept.lock().unwrap().push(g);
-                kept_count.fetch_add(1, Ordering::Relaxed);
-            });
+    let run = fill_patterns(&wl, &plan, &jobs, &cancel, &|d, n| {
+        if d.is_multiple_of(50) {
+            eprintln!("  filled {d}/{n} ...");
         }
     });
-    let dur = t0.elapsed().as_secs_f64();
+    let dur = run.elapsed_s;
+    let stop_at = plan.stop_after;
 
-    let mut kept = xfill_core::library::select_keepers(kept.into_inner().unwrap(), per_shape);
+    let mut kept = xfill_core::library::select_keepers(run.kept, per_shape, base_cfg.theme_weight);
     kept.truncate(top);
 
-    let filled_n = filled.load(Ordering::Relaxed);
-    let done_n = done.load(Ordering::Relaxed);
+    let filled_n = run.filled;
+    let done_n = run.done;
     eprintln!(
         "\nfilled {filled_n}/{done_n} in {dur:.1}s; {} grids kept over {} shapes",
         kept.len(),
@@ -338,12 +292,7 @@ fn main() {
     }
 
     // Clue every kept grid from the clue database (seeded, reproducible).
-    let mut crng = Rng::new(seed ^ 0xC1E5);
-    for g in &mut kept {
-        for e in &mut g.entries {
-            e.clue = clues.pick_clue(&e.answer, |n| crng.below(n));
-        }
-    }
+    assign_clues(&mut kept, &clues, seed);
     // then the language model, for missing (or all) clues
     if let Some(client) = &llm {
         for g in &mut kept {
