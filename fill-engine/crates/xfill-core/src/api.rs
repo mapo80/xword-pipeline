@@ -1389,7 +1389,8 @@ mod tests {
         let t = Instant::now();
         let r = generate(&d, &small(9, 9), &cancel_flag());
         assert_eq!(r.status, Status::NoGrid);
-        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        // 0.9 s here, ~5 s on slow CI machines; before the fix: minutes
+        assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
     }
 
     /// Theme slots follow the request, default on with theme words, never

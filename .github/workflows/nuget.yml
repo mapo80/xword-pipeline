@@ -78,7 +78,7 @@ jobs:
         working-directory: fill-engine/dotnet
         run: >
           dotnet test
-          -p:XfillCargoTarget=${{ github.workspace }}/fill-engine/target/${{ matrix.target }}/release
+          -p:XfillRustTarget=${{ matrix.target }}
           --coverlet --coverlet-include "[Cruciverba.Xfill]*"
           --coverlet-output-format cobertura
           --coverlet-threshold 90 --coverlet-threshold-type line --coverlet-threshold-stat Total

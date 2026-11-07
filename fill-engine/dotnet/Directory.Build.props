@@ -8,6 +8,8 @@
     <AnalysisLevel>latest-recommended</AnalysisLevel>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <!-- Native engine built by cargo (fill-engine/target/<profile>) -->
+    <!-- -p:XfillRustTarget=<triple> uses target/<triple>/release (cross builds in CI) -->
+    <XfillCargoTarget Condition="'$(XfillCargoTarget)' == '' and '$(XfillRustTarget)' != ''">$(MSBuildThisFileDirectory)../target/$(XfillRustTarget)/release</XfillCargoTarget>
     <XfillCargoTarget Condition="'$(XfillCargoTarget)' == ''">$(MSBuildThisFileDirectory)../target/release</XfillCargoTarget>
     <XfillNativeName Condition="'$(XfillNativeName)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">xfill.dll</XfillNativeName>
     <XfillNativeName Condition="'$(XfillNativeName)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">libxfill.dylib</XfillNativeName>
