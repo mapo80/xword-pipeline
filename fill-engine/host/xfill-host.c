@@ -568,7 +568,11 @@ int main(int argc, char **argv)
     /* stdout is the protocol: the library's own output goes to stderr */
 #ifdef _WIN32
     in_handle = GetStdHandle(STD_INPUT_HANDLE);
-    out_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    /* a private copy of the protocol pipe: redirecting the CRT's stdout below
+     * closes the original handle */
+    if (!DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_OUTPUT_HANDLE), GetCurrentProcess(), &out_handle, 0,
+                         FALSE, DUPLICATE_SAME_ACCESS))
+        die("cannot duplicate stdout", NULL);
     SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE));
     _dup2(_fileno(stderr), _fileno(stdout));
     InitializeCriticalSection(&out_lock);
