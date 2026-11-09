@@ -106,9 +106,11 @@ jobs:
         with:
           workspaces: fill-engine
 
-      - name: Native library
+      - name: Native library and engine host
         working-directory: fill-engine
-        run: cargo build --release -p xfill-ffi
+        run: |
+          cargo build --release -p xfill-ffi
+          host/build.sh target/release
 
       - uses: actions/setup-dotnet@v6
         with:

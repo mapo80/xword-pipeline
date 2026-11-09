@@ -72,16 +72,14 @@ jobs:
         if: runner.os != 'Windows'
         run: host/build.sh target/${{ matrix.target }}/release
 
-      - name: MSVC environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc }}
-
+      # MSVC environment for this step only (an exported Platform=x64 would break the .NET build)
       - name: Engine host (Windows)
         if: runner.os == 'Windows'
         shell: cmd
-        run: cl /nologo /O2 /W4 /WX /std:c11 host\xfill-host.c /Fe:target\${{ matrix.target }}\release\xfill-host.exe
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.msvc }} || exit /b 1
+          cl /nologo /O2 /W4 /WX /std:c11 host\xfill-host.c /Fe:target\${{ matrix.target }}\release\xfill-host.exe || exit /b 1
 
       - name: .NET SDK
         if: matrix.dotnet
