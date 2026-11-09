@@ -2,10 +2,17 @@
 //! for constraint propagation, `count_ones` for MRV, `iter_ones` for
 //! score-ordered candidate enumeration.
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Bitset {
     words: Box<[u64]>,
     nbits: usize,
+}
+
+impl AsRef<[u64]> for Bitset {
+    #[inline]
+    fn as_ref(&self) -> &[u64] {
+        &self.words
+    }
 }
 
 impl Bitset {
@@ -26,6 +33,24 @@ impl Bitset {
             words[nwords - 1] = (1u64 << rem) - 1;
         }
         Bitset { words, nbits }
+    }
+
+    /// The 64-bit blocks (bit i of the set is bit i%64 of block i/64).
+    #[inline]
+    pub fn blocks(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Mutable 64-bit blocks; callers keep the bits past `nbits` clear.
+    #[inline]
+    pub fn blocks_mut(&mut self) -> &mut [u64] {
+        &mut self.words
+    }
+
+    /// Clear every bit (no reallocation).
+    #[inline]
+    pub fn clear_all(&mut self) {
+        self.words.fill(0);
     }
 
     /// Heap memory of the bit storage (bytes).
@@ -55,40 +80,44 @@ impl Bitset {
 
     /// self &= other
     #[inline]
-    pub fn and_assign(&mut self, other: &Bitset) {
-        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+    pub fn and_assign<B: AsRef<[u64]> + ?Sized>(&mut self, other: &B) {
+        for (a, b) in self.words.iter_mut().zip(other.as_ref().iter()) {
             *a &= *b;
         }
     }
 
     /// self &= !other
     #[inline]
-    pub fn andnot_assign(&mut self, other: &Bitset) {
-        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+    pub fn andnot_assign<B: AsRef<[u64]> + ?Sized>(&mut self, other: &B) {
+        for (a, b) in self.words.iter_mut().zip(other.as_ref().iter()) {
             *a &= !*b;
         }
     }
 
     #[inline]
     /// Do `self` and `other` share a set bit below index `limit`?
-    pub fn intersects_below(&self, other: &Bitset, limit: usize) -> bool {
+    pub fn intersects_below<B: AsRef<[u64]> + ?Sized>(&self, other: &B, limit: usize) -> bool {
         let full = limit / 64;
         for i in 0..full.min(self.words.len()) {
-            if self.words[i] & other.words[i] != 0 {
+            if self.words[i] & other.as_ref()[i] != 0 {
                 return true;
             }
         }
         let rem = limit % 64;
         if rem > 0 && full < self.words.len() {
             let mask = (1u64 << rem) - 1;
-            return self.words[full] & other.words[full] & mask != 0;
+            return self.words[full] & other.as_ref()[full] & mask != 0;
         }
         false
     }
 
     /// Lowest index set in both `self` and `other`, if below `limit`.
-    pub fn first_and_below(&self, other: &Bitset, limit: usize) -> Option<usize> {
-        for (i, (a, b)) in self.words.iter().zip(other.words.iter()).enumerate() {
+    pub fn first_and_below<B: AsRef<[u64]> + ?Sized>(
+        &self,
+        other: &B,
+        limit: usize,
+    ) -> Option<usize> {
+        for (i, (a, b)) in self.words.iter().zip(other.as_ref().iter()).enumerate() {
             let x = a & b;
             if x != 0 {
                 let idx = i * 64 + x.trailing_zeros() as usize;
@@ -99,23 +128,23 @@ impl Bitset {
     }
 
     /// Number of bits set in both `self` and `other` below index `limit`.
-    pub fn count_and_below(&self, other: &Bitset, limit: usize) -> u32 {
+    pub fn count_and_below<B: AsRef<[u64]> + ?Sized>(&self, other: &B, limit: usize) -> u32 {
         let full = (limit / 64).min(self.words.len());
         let mut n: u32 = self.words[..full]
             .iter()
-            .zip(other.words[..full].iter())
+            .zip(other.as_ref()[..full].iter())
             .map(|(a, b)| (a & b).count_ones())
             .sum();
         let rem = limit % 64;
         if rem > 0 && full < self.words.len() {
             let mask = (1u64 << rem) - 1;
-            n += (self.words[full] & other.words[full] & mask).count_ones();
+            n += (self.words[full] & other.as_ref()[full] & mask).count_ones();
         }
         n
     }
 
-    pub fn or_assign(&mut self, other: &Bitset) {
-        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+    pub fn or_assign<B: AsRef<[u64]> + ?Sized>(&mut self, other: &B) {
+        for (a, b) in self.words.iter_mut().zip(other.as_ref().iter()) {
             *a |= *b;
         }
     }

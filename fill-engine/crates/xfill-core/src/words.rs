@@ -72,7 +72,7 @@ pub fn find_pattern(wl: &Wordlist, pattern: &str) -> Result<Vec<(String, u8)>, S
         if fixed && len != toks.len() {
             continue;
         }
-        for (i, w) in ld.letters.iter().enumerate() {
+        for (i, w) in ld.flat.chunks_exact(ld.len.max(1)).take(ld.n).enumerate() {
             if w.iter().all(|&c| c < REBUS_BASE) && matches(&toks, w) {
                 out.push((wl.word(len, i), ld.scores[i]));
             }
@@ -155,7 +155,7 @@ pub fn anagrams(wl: &Wordlist, letters: &str, max_words: usize, limit: usize) ->
         if len as i32 > total {
             continue;
         }
-        for (i, w) in ld.letters.iter().enumerate() {
+        for (i, w) in ld.flat.chunks_exact(ld.len.max(1)).take(ld.n).enumerate() {
             if w.iter().any(|&c| c >= REBUS_BASE) {
                 continue;
             }

@@ -275,6 +275,10 @@ pub struct SolveConfig {
     /// Cooperative cancellation: when set, the search stops at the next
     /// check (used by [`solve_portfolio`] to stop the losing workers).
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A second stop flag, checked like `cancel`: the caller's
+    /// cancellation and an internal stop (e.g. [`crate::api::fill_patterns`]
+    /// once its pool is complete) can be raised independently.
+    pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub time_limit_s: f64,
     /// Work budget in search nodes for the whole solve (0 = none). With a
     /// node budget the search no longer depends on the machine's speed:
@@ -718,6 +722,7 @@ impl Default for SolveConfig {
             free_rebus: Vec::new(),
             theme: Default::default(),
             cancel: None,
+            halt: None,
             time_limit_s: 30.0,
             node_limit: 0,
             theme_weight: 0.0,
@@ -781,21 +786,43 @@ pub struct SolveResult {
 }
 
 /// A domain snapshot taken before an entry's domain is changed.
-struct Saved {
-    entry: usize,
-    domain: Bitset,
-    count: u32,
-    culprits: Bitset,
-    masks: Vec<u32>,
-    support: Vec<u32>,
+const MAX_LEN_1: usize = crate::wordlist::MAX_LEN + 1;
+
+/// Per (length, position): the symbols some word of the list has there.
+fn present_symbols(wl: &Wordlist) -> Vec<u32> {
+    let mut out = vec![0u32; MAX_LEN_1 * MAX_LEN_1];
+    for ld in &wl.by_len {
+        for pos in 0..ld.len {
+            for c in 0..ALPHA as u8 {
+                if ld.n > 0 && ld.pos_count(pos, c) > 0 {
+                    out[ld.len * MAX_LEN_1 + pos] |= 1 << c;
+                }
+            }
+        }
+    }
+    out
 }
 
+/// The domain data itself (blocks, culprits, masks, supports) lives in the
+/// solver's trail arenas at `off64` / `off32`, so saving allocates nothing.
+#[derive(Clone, Copy)]
+struct Saved {
+    entry: usize,
+    count: u32,
+    off64: usize,
+    off32: usize,
+    off16: usize,
+}
+
+/// One assignment on the trail. Its snapshots are `trail[saved..]` and its
+/// cells `trail_cells[cells..]` at undo time (frames are undone last-in
+/// first-out, so later frames are gone by then).
 struct TrailFrame {
     entry: usize,
     word: usize,
     len: usize,
-    nbrs: Vec<Saved>,
-    set_cells: Vec<usize>,
+    saved: usize,
+    cells: usize,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -863,6 +890,7 @@ pub struct Solver<'a> {
     /// learned nogoods: (entry, word, floor at which it was proven)
     learned: Vec<(usize, usize, u8)>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// k-grams (k = avoid_substrings) of the placed answers → depths of the
     /// entries holding them (`STATIC` for locked answers)
     grams: std::collections::HashMap<u64, Vec<usize>>,
@@ -877,11 +905,40 @@ pub struct Solver<'a> {
     conflict: Bitset,
     /// rebus symbols (bit = symbol) the solver may place in any cell
     free_rebus: u32,
+    /// per (length, position): symbols that some word has there
+    /// (`present[len * MAX_LEN_1 + pos]`)
+    present: Vec<u32>,
+    /// snapshots of the domains changed by the frames on the trail
+    trail: Vec<Saved>,
+    /// arena of the snapshots' 64-bit data (domain blocks, culprits)
+    trail64: Vec<u64>,
+    /// arena of the snapshots' masks
+    trail32: Vec<u32>,
+    /// arena of the snapshots' supports
+    trail16: Vec<u16>,
+    /// symbols per position in `support` (26 letters + the rebus strings)
+    sym: usize,
+    /// cells set by the frames on the trail
+    trail_cells: Vec<usize>,
+    /// scratch: words to remove (one block per 64 words)
+    scratch: Vec<u64>,
+    /// candidates of the nodes on the search path, stacked (a node's batch
+    /// is the top of the stack while it runs)
+    cand_stack: Vec<usize>,
+    /// per depth: the node's conflict set being collected
+    conf_stack: Vec<Bitset>,
+    /// scratch of `push_candidates`: open crossings, candidates, sort keys
+    buf_cross: Vec<(usize, usize, usize)>,
+    buf_cands: Vec<(usize, u8, u32)>,
+    buf_keyed: Vec<(usize, i64, u32)>,
+    /// scratch: revision queue and its membership flags
+    queue: std::collections::VecDeque<usize>,
+    in_queue: Vec<bool>,
     /// per entry, per position: letters still possible (bit c = letter c)
     masks: Vec<Vec<u32>>,
     /// per entry: in-tier candidates with letter c at position p, at
     /// index p * ALPHA + c (keeps `masks` up to date incrementally)
-    support: Vec<Vec<u32>>,
+    support: Vec<Vec<u16>>,
 }
 
 impl<'a> Solver<'a> {
@@ -1020,6 +1077,7 @@ impl<'a> Solver<'a> {
             theme_slots: defaults.theme_slots,
             learned: Vec::new(),
             cancel: None,
+            halt: None,
             grams: std::collections::HashMap::new(),
             gram_conflict: Bitset::zeros(n.max(1)),
             saved_in: vec![0; n],
@@ -1027,11 +1085,26 @@ impl<'a> Solver<'a> {
             culprits: vec![Bitset::zeros(n.max(1)); n],
             free_rebus: 0,
             conflict: Bitset::zeros(n.max(1)),
+            present: present_symbols(wl),
+            trail: Vec::new(),
+            trail64: Vec::new(),
+            trail32: Vec::new(),
+            trail16: Vec::new(),
+            sym: REBUS_BASE as usize + wl.rebus.len(),
+            trail_cells: Vec::new(),
+            scratch: Vec::new(),
+            cand_stack: Vec::new(),
+            conf_stack: Vec::new(),
+            buf_cross: Vec::new(),
+            buf_cands: Vec::new(),
+            buf_keyed: Vec::new(),
+            queue: std::collections::VecDeque::new(),
+            in_queue: vec![false; n],
             masks: p.entries.iter().map(|e| vec![0u32; e.len]).collect(),
             support: p
                 .entries
                 .iter()
-                .map(|e| vec![0u32; e.len * ALPHA])
+                .map(|e| vec![0u16; e.len * (REBUS_BASE as usize + wl.rebus.len())])
                 .collect(),
         };
         s.compute_base();
@@ -1118,9 +1191,11 @@ impl<'a> Solver<'a> {
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel
-            .as_ref()
-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        let up = |f: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>| {
+            f.as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        up(&self.cancel) || up(&self.halt)
     }
 
     /// Guided selection for entry `ei`: its candidates (at most `limit`)
@@ -1156,7 +1231,7 @@ impl<'a> Solver<'a> {
             if w >= self.cutoff_by_entry[ei] {
                 break;
             }
-            let letters = &ld.letters[w];
+            let letters = &ld.word_letters(w);
             let (mut completed, mut reach, mut least, mut dead) = (0u32, 0f64, u32::MAX, false);
             for &(pos, nbr, npos) in &self.crossings[ei] {
                 if !open(self, nbr) {
@@ -1306,15 +1381,13 @@ impl<'a> Solver<'a> {
             let ld = self.wl.len_data(e.len);
             for (pos, &cid) in e.cells.iter().enumerate() {
                 if let Some(c) = self.base_cell_letter[cid] {
-                    let mask = ld.compat(pos, c).clone();
-                    self.domains[ei].and_assign(&mask);
+                    self.domains[ei].and_assign(ld.compat(pos, c));
                 } else {
                     // rebus symbols only where the template puts them,
                     // unless the string is free
                     for sym in REBUS_BASE..REBUS_BASE + n_rebus {
                         if self.free_rebus & (1 << sym) == 0 {
-                            let mask = ld.compat(pos, sym).clone();
-                            self.domains[ei].andnot_assign(&mask);
+                            self.domains[ei].andnot_assign(ld.compat(pos, sym));
                         }
                     }
                 }
@@ -1371,6 +1444,7 @@ impl<'a> Solver<'a> {
             self.learn = false;
         }
         self.cancel = cfg.cancel.clone();
+        self.halt = cfg.halt.clone();
         self.rng = Rng::new(cfg.seed);
         self.locked_theme = if self.theme.is_empty() {
             0
@@ -1918,6 +1992,7 @@ impl<'a> Solver<'a> {
             free_rebus: cfg.free_rebus.clone(),
             theme: cfg.theme.clone(),
             cancel: cfg.cancel.clone(),
+            halt: cfg.halt.clone(),
             node_limit,
             theme_weight: cfg.theme_weight,
             theme_slots: cfg.theme_slots,
@@ -1982,6 +2057,7 @@ impl<'a> Solver<'a> {
         self.cand_ratio = cfg.cand_ratio.max(1);
         self.optimize = Optimize::Weak; // best scores first: tight bounds early
         self.cancel = cfg.cancel.clone();
+        self.halt = cfg.halt.clone();
         self.avoid_substrings = cfg.avoid_substrings;
         let floor = cfg.tiers.iter().copied().min().unwrap_or(0);
         self.floor = floor;
@@ -2095,12 +2171,18 @@ impl<'a> Solver<'a> {
 
     /// Reset the working state to the base domains for a search at `floor`.
     fn reset(&mut self, floor: u8) {
-        let n = self.p.entries.len().max(1);
+        // frames (and candidate batches) left by a solved attempt are dropped
+        self.cand_stack.clear();
+        self.trail.clear();
+        self.trail64.clear();
+        self.trail32.clear();
+        self.trail16.clear();
+        self.trail_cells.clear();
         for c in self.culprits.iter_mut() {
-            *c = Bitset::zeros(n);
+            c.clear_all();
         }
-        for l in 0..self.used.len() {
-            self.used[l] = Bitset::zeros(self.wl.by_len[l].n.max(1));
+        for u in self.used.iter_mut() {
+            u.clear_all();
         }
         // Locked answers present in the wordlist are marked used so the search
         // can't reuse them elsewhere (no duplicate answers).
@@ -2148,9 +2230,12 @@ impl<'a> Solver<'a> {
     /// candidates? (Checks the post-propagation counts; the frame only holds
     /// the saved pre-assignment values for undo.)
     fn frame_dead(&mut self, frame: &TrailFrame) -> bool {
-        match frame.nbrs.iter().find(|sv| self.dom_count[sv.entry] == 0) {
+        match self.trail[frame.saved..]
+            .iter()
+            .find(|sv| self.dom_count[sv.entry] == 0)
+        {
             Some(sv) => {
-                self.conflict = self.culprits[sv.entry].clone();
+                self.conflict.copy_from(&self.culprits[sv.entry]);
                 true
             }
             None => false,
@@ -2182,15 +2267,39 @@ impl<'a> Solver<'a> {
             return Outcome::Exhausted;
         };
 
-        let mut conf = self.culprits[ei].clone();
+        // the node's conflict set, in a buffer kept per depth
+        if self.conf_stack.len() <= depth {
+            let nbits = self.conflict.nbits();
+            self.conf_stack
+                .resize_with(depth + 1, || Bitset::zeros(nbits));
+        }
+        let mut conf = std::mem::take(&mut self.conf_stack[depth]);
+        conf.copy_from(&self.culprits[ei]);
+        let base = self.cand_stack.len();
+        let out = self.branch(ei, depth, &mut conf);
+        self.cand_stack.truncate(base);
+        if out.is_none() {
+            conf.clear(depth);
+            self.conflict.copy_from(&conf);
+        }
+        self.conf_stack[depth] = conf;
+        out.unwrap_or(Outcome::Exhausted)
+    }
+
+    /// Try the candidates of `ei` at `depth`, collecting the conflict set in
+    /// `conf`. `None` when every candidate failed (the caller sets the
+    /// node's conflict from `conf`), else the outcome to return as is.
+    fn branch(&mut self, ei: usize, depth: usize, conf: &mut Bitset) -> Option<Outcome> {
         let mut from = 0usize;
         loop {
-            let (candidates, next) = self.ordered_candidates_from(ei, from);
+            let (start, next) = self.push_candidates(ei, from);
+            let end = self.cand_stack.len();
             // candidates rejected for repeated substrings depend on the entries
             // holding those substrings
             conf.or_assign(&self.gram_conflict);
 
-            for w in candidates {
+            for i in start..end {
+                let w = self.cand_stack[i];
                 // a candidate that fails propagation costs work too: count
                 // it, and look at the clock, so a node with thousands of
                 // dead candidates stays within the budget
@@ -2199,7 +2308,7 @@ impl<'a> Solver<'a> {
                     || (self.trials & 15 == 0
                         && (Instant::now() >= self.deadline || self.cancelled()))
                 {
-                    return Outcome::TimeLimit;
+                    return Some(Outcome::TimeLimit);
                 }
                 let mut frame = self.assign(ei, w);
                 let alive = !self.frame_dead(&frame)
@@ -2207,17 +2316,17 @@ impl<'a> Solver<'a> {
                     && (self.pangram == 0 || self.pangram_possible());
                 if alive {
                     match self.recurse() {
-                        Outcome::Solved => return Outcome::Solved,
+                        Outcome::Solved => return Some(Outcome::Solved),
                         r @ (Outcome::Budget | Outcome::TimeLimit) => {
                             self.undo(frame);
-                            return r;
+                            return Some(r);
                         }
                         Outcome::Exhausted => {
                             if self.backjump && !self.conflict.get(depth) {
                                 // The failure below doesn't involve this choice:
                                 // no other candidate here can fix it — jump.
                                 self.undo(frame);
-                                return Outcome::Exhausted;
+                                return Some(Outcome::Exhausted);
                             }
                         }
                     }
@@ -2234,14 +2343,9 @@ impl<'a> Solver<'a> {
                 conf.or_assign(&self.conflict);
                 self.undo(frame);
             }
-            match next {
-                Some(n) => from = n, // load the next batch
-                None => break,
-            }
+            self.cand_stack.truncate(start);
+            from = next?; // load the next batch, if any
         }
-        conf.clear(depth);
-        self.conflict = conf;
-        Outcome::Exhausted
     }
 
     fn all_below(nbits: usize, depth: usize) -> Bitset {
@@ -2266,8 +2370,10 @@ impl<'a> Solver<'a> {
             Linked::On => 1,
         };
         let n = self.p.entries.len();
-        let mut dist = vec![usize::MAX; n];
+        // (only computed, and allocated, with "linked")
+        let mut dist: Vec<usize> = Vec::new();
         if max_dist != usize::MAX {
+            dist = vec![usize::MAX; n];
             let mut frontier: Vec<usize> = (0..n).filter(|&e| filled(e)).collect();
             for &e in &frontier {
                 dist[e] = 0;
@@ -2307,10 +2413,11 @@ impl<'a> Solver<'a> {
         // key: candidates (per empty cell for PerCell, scaled to stay
         // integral), then longer entry first
         let mut best_key = (u64::MAX, 0usize);
-        for (ei, &d) in dist.iter().enumerate() {
+        for ei in 0..n {
             if !open(ei) {
                 continue;
             }
+            let d = dist.get(ei).copied().unwrap_or(usize::MAX);
             if only_linked && d > max_dist {
                 continue;
             }
@@ -2381,13 +2488,23 @@ impl<'a> Solver<'a> {
     /// The next batch of candidates for `ei` among its domain words with
     /// index >= `from`, ordered; plus where the following batch starts.
     fn ordered_candidates_from(&mut self, ei: usize, from: usize) -> (Vec<usize>, Option<usize>) {
+        let (start, next) = self.push_candidates(ei, from);
+        let out = self.cand_stack[start..].to_vec();
+        self.cand_stack.truncate(start);
+        (out, next)
+    }
+
+    /// [`Self::ordered_candidates_from`] pushing the batch on `cand_stack`:
+    /// (where it starts, where the next batch starts).
+    fn push_candidates(&mut self, ei: usize, from: usize) -> (usize, Option<usize>) {
         let len = self.p.entries[ei].len;
         let cutoff = self.cutoff_by_entry[ei];
         let batch = self.batch_size(ei);
         let mut next: Option<usize> = None;
 
         // Active crossings to unassigned neighbors: (pos_in_ei, nbr_len, nbr_pos)
-        let mut cross: Vec<(usize, usize, usize)> = Vec::new();
+        let mut cross = std::mem::take(&mut self.buf_cross);
+        cross.clear();
         for &(pos, nbr, npos) in &self.crossings[ei] {
             if self.assigned[nbr].is_none() && !self.is_locked[nbr] {
                 cross.push((pos, self.p.entries[nbr].len, npos));
@@ -2395,7 +2512,8 @@ impl<'a> Solver<'a> {
         }
 
         // (word, score, lcv)
-        let mut cands: Vec<(usize, u8, u32)> = Vec::new();
+        let mut cands = std::mem::take(&mut self.buf_cands);
+        cands.clear();
         let mut gram_culprits: Vec<usize> = Vec::new();
         {
             let ld = self.wl.len_data(len);
@@ -2432,7 +2550,7 @@ impl<'a> Solver<'a> {
                 if used.get(w) {
                     continue;
                 }
-                let letters = &ld.letters[w];
+                let letters = &ld.word_letters(w);
                 if self.avoid_substrings > 0 {
                     let clash: Vec<usize> = Self::gram_keys(letters, self.avoid_substrings)
                         .iter()
@@ -2454,24 +2572,28 @@ impl<'a> Solver<'a> {
         }
 
         let nbits = self.gram_conflict.nbits();
-        self.gram_conflict = Bitset::zeros(nbits);
+        self.gram_conflict.clear_all();
         for d in gram_culprits {
             if d < nbits {
                 self.gram_conflict.set(d); // STATIC (locked) grams carry no depth
             }
         }
 
-        let mut keyed: Vec<(usize, i64)> = cands
-            .iter()
-            .map(|&(w, sc, lcv)| (w, self.order_key(ei, len, w, sc, lcv)))
-            .collect();
+        let mut keyed = std::mem::take(&mut self.buf_keyed);
+        keyed.clear();
+        for (i, &(w, sc, lcv)) in cands.iter().enumerate() {
+            keyed.push((w, self.order_key(ei, len, w, sc, lcv), i as u32));
+        }
+        self.buf_cands = cands;
+        self.buf_cross = cross;
         if self.pangram > 0 {
             // words bringing letters the pangram still lacks go first
             let counts = self.letter_counts();
             let k = self.pangram as u32;
             let ld = self.wl.len_data(len);
-            for (w, key) in keyed.iter_mut() {
-                let gain = ld.letters[*w]
+            for (w, key, _) in keyed.iter_mut() {
+                let gain = ld
+                    .word_letters(*w)
                     .iter()
                     .filter(|&&c| self.pangram_mask & (1 << c) != 0 && counts[c as usize] < k)
                     .collect::<std::collections::HashSet<_>>()
@@ -2479,12 +2601,18 @@ impl<'a> Solver<'a> {
                 *key = key.saturating_add(gain * 1_000_000_000_000);
             }
         }
-        keyed.sort_by_key(|a| std::cmp::Reverse(a.1));
-        let mut out: Vec<usize> = keyed.into_iter().map(|(w, _)| w).collect();
+        // key descending, ties in candidate order (a stable sort, without
+        // its buffer)
+        keyed.sort_unstable_by_key(|a| (std::cmp::Reverse(a.1), a.2));
+        let start = self.cand_stack.len();
+        self.cand_stack.extend(keyed.iter().map(|&(w, _, _)| w));
+        self.buf_keyed = keyed;
         if self.lookahead > 0 {
+            let mut out = self.cand_stack.split_off(start);
             self.apply_lookahead(ei, &mut out);
+            self.cand_stack.extend(out);
         }
-        (out, next)
+        (start, next)
     }
 
     /// Sort key (higher = tried first) of candidate `w` for `ei` under the
@@ -2496,7 +2624,7 @@ impl<'a> Solver<'a> {
             let j = 850 + s.rng.below(301) as i64; // 0.85..1.15
             (sc / 5) as i64 * 1_000_000_000 + (lcv as i64 * j / 1000)
         };
-        let letters = &self.wl.len_data(len).letters[w];
+        let letters = &self.wl.len_data(len).word_letters(w);
         // per open crossing: (all its other cells filled?, best score of a
         // compatible word, number of compatible words)
         let crossing_info = |s: &Self| -> Vec<(bool, Option<u8>, u32)> {
@@ -2590,7 +2718,7 @@ impl<'a> Solver<'a> {
             for &(pos, nbr, npos) in &cross {
                 let nld = self.wl.len_data(self.p.entries[nbr].len);
                 let c = self.domains[nbr].count_and_below(
-                    nld.compat(npos, ld.letters[w][pos]),
+                    nld.compat(npos, ld.word_letters(w)[pos]),
                     self.cutoff_by_entry[nbr],
                 );
                 least = least.min(c);
@@ -2607,14 +2735,15 @@ impl<'a> Solver<'a> {
     }
 
     fn assign(&mut self, ei: usize, w: usize) -> TrailFrame {
-        let len = self.p.entries[ei].len;
-        let letters: Vec<u8> = self.wl.len_data(len).letters[w].to_vec();
+        let (p, wl) = (self.p, self.wl);
+        let len = p.entries[ei].len;
+        let letters = wl.len_data(len).word_letters(w);
 
         self.assigned[ei] = Some(w);
         self.used[len].set(w);
         self.n_assigned += 1;
         if self.avoid_substrings > 0 {
-            self.push_grams(&letters, self.n_assigned - 1);
+            self.push_grams(letters, self.n_assigned - 1);
         }
 
         self.serial += 1;
@@ -2623,8 +2752,8 @@ impl<'a> Solver<'a> {
             entry: ei,
             word: w,
             len,
-            nbrs: Vec::new(),
-            set_cells: Vec::new(),
+            saved: self.trail.len(),
+            cells: self.trail_cells.len(),
         };
         // The word is taken: drop it from the other same-length domains.
         for k in 0..self.same_len[ei].len() {
@@ -2636,39 +2765,42 @@ impl<'a> Solver<'a> {
             self.culprits[o].set(depth);
             self.remove_one(o, w);
         }
-        let cells = self.p.entries[ei].cells.clone();
-        for (pos, &cid) in cells.iter().enumerate() {
+        for (pos, &cid) in p.entries[ei].cells.iter().enumerate() {
             let ch = letters[pos];
             if self.cell_letter[cid].is_none() {
                 self.cell_letter[cid] = Some(ch);
-                frame.set_cells.push(cid);
+                self.trail_cells.push(cid);
             }
-            for &(nbr, npos) in &self.p.cell_entries[cid] {
+            for &(nbr, npos) in &p.cell_entries[cid] {
                 if nbr == ei || self.assigned[nbr].is_some() || self.is_locked[nbr] {
                     continue;
                 }
-                let nlen = self.p.entries[nbr].len;
-                let mut diff = self.domains[nbr].clone();
-                diff.andnot_assign(self.wl.len_data(nlen).compat(npos, ch));
+                let keep = wl.len_data(p.entries[nbr].len).compat(npos, ch);
                 self.save(&mut frame, nbr);
                 self.culprits[nbr].set(depth);
-                self.remove_words(nbr, &diff);
+                // drop the words without `ch` at `npos`
+                self.remove_masked(nbr, |k, _| !keep[k]);
             }
         }
         frame
     }
 
     /// Snapshot `e`'s domain into `frame` (once per frame) before changing it.
-    fn save(&mut self, frame: &mut TrailFrame, e: usize) {
+    fn save(&mut self, _frame: &mut TrailFrame, e: usize) {
         if self.saved_in[e] != self.serial {
             self.saved_in[e] = self.serial;
-            frame.nbrs.push(Saved {
+            let (off64, off32, off16) =
+                (self.trail64.len(), self.trail32.len(), self.trail16.len());
+            self.trail64.extend_from_slice(self.domains[e].blocks());
+            self.trail64.extend_from_slice(self.culprits[e].blocks());
+            self.trail32.extend_from_slice(&self.masks[e]);
+            self.trail16.extend_from_slice(&self.support[e]);
+            self.trail.push(Saved {
                 entry: e,
-                domain: self.domains[e].clone(),
                 count: self.dom_count[e],
-                culprits: self.culprits[e].clone(),
-                masks: self.masks[e].clone(),
-                support: self.support[e].clone(),
+                off64,
+                off32,
+                off16,
             });
         }
     }
@@ -2679,60 +2811,116 @@ impl<'a> Solver<'a> {
     }
 
     /// Recompute `e`'s in-tier count, letter supports and masks from its
-    /// domain (attempt start).
+    /// domain (attempt start, or after removing most of the domain).
     fn rebuild(&mut self, e: usize) {
         let cutoff = self.cutoff_by_entry[e];
         let ld = self.wl.len_data(self.p.entries[e].len);
-        let len = self.p.entries[e].len;
-        let mut sup = vec![0u32; len * ALPHA];
+        let len = ld.len;
+        let sym = self.sym;
+        let sup = &mut self.support[e];
+        sup.fill(0);
         let mut count = 0u32;
         for w in self.domains[e].iter_ones() {
             if w >= cutoff {
                 break;
             }
             count += 1;
-            for (p, &c) in ld.letters[w].iter().enumerate() {
-                sup[p * ALPHA + c as usize] += 1;
+            for (p, &c) in ld.flat[w * len..(w + 1) * len].iter().enumerate() {
+                sup[p * sym + c as usize] += 1;
             }
         }
-        let mut m = vec![0u32; len];
-        for (p, mp) in m.iter_mut().enumerate() {
-            for c in 0..ALPHA {
-                if sup[p * ALPHA + c] > 0 {
-                    *mp |= 1 << c;
+        for (p, mp) in self.masks[e].iter_mut().enumerate() {
+            let mut m = 0u32;
+            for (c, &n) in sup[p * sym..(p + 1) * sym].iter().enumerate() {
+                if n > 0 {
+                    m |= 1 << c;
                 }
             }
+            *mp = m;
         }
         self.dom_count[e] = count;
-        self.support[e] = sup;
-        self.masks[e] = m;
     }
 
-    /// Remove `diff` (a subset of `e`'s domain) from the domain, updating
-    /// count, supports and masks for the in-tier words removed.
-    fn remove_words(&mut self, e: usize, diff: &Bitset) {
+    /// Remove from `e`'s domain the words of block `k` set in `drop(k)`,
+    /// updating count, supports and masks for the in-tier words removed.
+    /// Supports are decremented word by word when few words go, and
+    /// recounted from the words left when most go (same result, cheaper).
+    #[inline]
+    fn remove_masked<F: Fn(usize, u64) -> u64>(&mut self, e: usize, drop: F) {
         let cutoff = self.cutoff_by_entry[e];
-        let ld = self.wl.len_data(self.p.entries[e].len);
-        for w in diff.iter_ones() {
-            if w >= cutoff {
-                break;
+        let mut diff = std::mem::take(&mut self.scratch);
+        let dom = self.domains[e].blocks_mut();
+        let nb = dom.len();
+        diff.clear();
+        diff.resize(nb, 0);
+        // pass 1: the words to remove, and how many of them are in tier
+        let mut removed = 0u32;
+        let full = (cutoff / 64).min(nb);
+        for k in 0..nb {
+            let d = dom[k];
+            if d == 0 {
+                continue;
             }
+            let x = d & drop(k, d);
+            diff[k] = x;
+            if k < full {
+                removed += x.count_ones();
+            } else if k == full {
+                removed += (x & ((1u64 << (cutoff % 64)) - 1)).count_ones();
+            }
+        }
+        for k in 0..nb {
+            dom[k] &= !diff[k];
+        }
+        if removed > 0 {
+            let left = self.dom_count[e] - removed;
+            if removed > left {
+                self.rebuild(e);
+            } else {
+                let ld = self.wl.len_data(self.p.entries[e].len);
+                let len = ld.len;
+                let sym = self.sym;
+                let sup = &mut self.support[e];
+                let masks = &mut self.masks[e];
+                'blocks: for (k, &x) in diff.iter().enumerate() {
+                    let mut x = x;
+                    while x != 0 {
+                        let w = k * 64 + x.trailing_zeros() as usize;
+                        if w >= cutoff {
+                            break 'blocks;
+                        }
+                        x &= x - 1;
+                        for (p, &c) in ld.flat[w * len..(w + 1) * len].iter().enumerate() {
+                            let i = p * sym + c as usize;
+                            let v = sup[i] - 1;
+                            sup[i] = v;
+                            // branch-free: clear the letter when its last word goes
+                            masks[p] &= !(((v == 0) as u32) << c);
+                        }
+                    }
+                }
+                self.dom_count[e] = left;
+            }
+        }
+        self.scratch = diff;
+    }
+
+    fn remove_one(&mut self, e: usize, w: usize) {
+        if w < self.cutoff_by_entry[e] {
+            let ld = self.wl.len_data(self.p.entries[e].len);
+            let len = ld.len;
+            let sym = self.sym;
             self.dom_count[e] -= 1;
-            for (p, &c) in ld.letters[w].iter().enumerate() {
-                let k = p * ALPHA + c as usize;
-                self.support[e][k] -= 1;
-                if self.support[e][k] == 0 {
+            let sup = &mut self.support[e];
+            for (p, &c) in ld.flat[w * len..(w + 1) * len].iter().enumerate() {
+                let i = p * sym + c as usize;
+                sup[i] -= 1;
+                if sup[i] == 0 {
                     self.masks[e][p] &= !(1 << c);
                 }
             }
         }
-        self.domains[e].andnot_assign(diff);
-    }
-
-    fn remove_one(&mut self, e: usize, w: usize) {
-        let mut d = Bitset::zeros(self.domains[e].nbits());
-        d.set(w);
-        self.remove_words(e, &d);
+        self.domains[e].clear(w);
     }
 
     /// Letters (bit c = letter c) that entry `e` can still have at `pos`,
@@ -2756,30 +2944,33 @@ impl<'a> Solver<'a> {
     /// point. Every changed domain is saved in `frame`. Returns false on a
     /// wipeout (some entry left with no in-tier candidate).
     fn propagate(&mut self, frame: &mut TrailFrame) -> bool {
-        let start: Vec<usize> = frame.nbrs.iter().map(|sv| sv.entry).collect();
-        self.revise_from(start, Some(frame))
+        for i in frame.saved..self.trail.len() {
+            let e = self.trail[i].entry;
+            if !self.in_queue[e] {
+                self.in_queue[e] = true;
+                self.queue.push_back(e);
+            }
+        }
+        self.revise_queue(Some(frame))
     }
 
     /// Arc consistency over the whole grid (attempt start; no trail).
     fn propagate_all(&mut self) -> bool {
-        let start: Vec<usize> = (0..self.p.entries.len())
-            .filter(|&e| self.assigned[e].is_none() && !self.is_locked[e])
-            .collect();
-        self.revise_from(start, None)
-    }
-
-    fn revise_from(&mut self, start: Vec<usize>, mut frame: Option<&mut TrailFrame>) -> bool {
-        let n = self.p.entries.len();
-        let mut in_queue = vec![false; n];
-        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-        for e in start {
-            if !in_queue[e] {
-                in_queue[e] = true;
-                queue.push_back(e);
+        for e in 0..self.p.entries.len() {
+            if self.assigned[e].is_none() && !self.is_locked[e] && !self.in_queue[e] {
+                self.in_queue[e] = true;
+                self.queue.push_back(e);
             }
         }
-        while let Some(s) = queue.pop_front() {
-            in_queue[s] = false;
+        self.revise_queue(None)
+    }
+
+    /// Revise the queued entries' crossings to a fixed point; the queue is
+    /// empty on return.
+    fn revise_queue(&mut self, mut frame: Option<&mut TrailFrame>) -> bool {
+        let wl = self.wl;
+        while let Some(s) = self.queue.pop_front() {
+            self.in_queue[s] = false;
             for k in 0..self.crossings[s].len() {
                 let (pos, t, tpos) = self.crossings[s][k];
                 if self.assigned[t].is_some() || self.is_locked[t] {
@@ -2790,29 +2981,57 @@ impl<'a> Solver<'a> {
                 if removed == 0 {
                     continue; // nothing to remove from t
                 }
-                let ld = self.wl.len_data(self.p.entries[t].len);
-                let mut drop = Bitset::zeros(ld.n.max(1));
-                for c in 0..ALPHA as u8 {
-                    if removed & (1 << c) != 0 {
-                        drop.or_assign(ld.compat(tpos, c));
-                    }
-                }
                 if let Some(f) = frame.as_deref_mut() {
                     self.save(f, t);
                     // t shrinks because s did: inherit s's culprits
-                    let cs = self.culprits[s].clone();
-                    self.culprits[t].or_assign(&cs);
+                    let (cs, ct) = if s < t {
+                        let (a, b) = self.culprits.split_at_mut(t);
+                        (&a[s], &mut b[0])
+                    } else {
+                        let (a, b) = self.culprits.split_at_mut(s);
+                        (&b[0], &mut a[t])
+                    };
+                    ct.or_assign(cs);
                 }
-                let mut diff = self.domains[t].clone();
-                diff.and_assign(&drop);
-                self.remove_words(t, &diff);
+                let ld = wl.len_data(self.p.entries[t].len);
+                // Each word has one letter at tpos, so "letter in `removed`"
+                // is "letter not among the others": OR the compat masks of
+                // the smaller of the two sets (complemented for the others).
+                let present = self.present[ld.len * MAX_LEN_1 + tpos];
+                let others = present & !removed;
+                let (set, invert) = if others.count_ones() < removed.count_ones() {
+                    (others, true)
+                } else {
+                    (removed & present, false)
+                };
+                let mut masks: [&[u64]; ALPHA] = [&[]; ALPHA];
+                let mut nd = 0;
+                let mut r = set;
+                while r != 0 {
+                    let c = r.trailing_zeros() as u8;
+                    r &= r - 1;
+                    masks[nd] = ld.compat(tpos, c);
+                    nd += 1;
+                }
+                let masks = &masks[..nd];
+                self.remove_masked(t, |k, _| {
+                    let m = masks.iter().fold(0u64, |m, d| m | d[k]);
+                    if invert {
+                        !m
+                    } else {
+                        m
+                    }
+                });
                 if self.dom_count[t] == 0 {
-                    self.conflict = self.culprits[t].clone();
+                    self.conflict.copy_from(&self.culprits[t]);
+                    while let Some(q) = self.queue.pop_front() {
+                        self.in_queue[q] = false;
+                    }
                     return false;
                 }
-                if !in_queue[t] {
-                    in_queue[t] = true;
-                    queue.push_back(t);
+                if !self.in_queue[t] {
+                    self.in_queue[t] = true;
+                    self.queue.push_back(t);
                 }
             }
         }
@@ -2821,19 +3040,32 @@ impl<'a> Solver<'a> {
 
     fn undo(&mut self, frame: TrailFrame) {
         // reverse order: an entry saved twice gets its oldest snapshot back
-        for sv in frame.nbrs.into_iter().rev() {
-            self.domains[sv.entry].copy_from(&sv.domain);
-            self.dom_count[sv.entry] = sv.count;
-            self.culprits[sv.entry] = sv.culprits;
-            self.masks[sv.entry] = sv.masks;
-            self.support[sv.entry] = sv.support;
+        while self.trail.len() > frame.saved {
+            let sv = self.trail.pop().expect("trail");
+            let e = sv.entry;
+            let nb = self.domains[e].blocks().len();
+            let nc = self.culprits[e].blocks().len();
+            let a = &self.trail64[sv.off64..];
+            self.domains[e].blocks_mut().copy_from_slice(&a[..nb]);
+            self.culprits[e]
+                .blocks_mut()
+                .copy_from_slice(&a[nb..nb + nc]);
+            let nm = self.masks[e].len();
+            let ns = self.support[e].len();
+            self.masks[e].copy_from_slice(&self.trail32[sv.off32..sv.off32 + nm]);
+            self.support[e].copy_from_slice(&self.trail16[sv.off16..sv.off16 + ns]);
+            self.dom_count[e] = sv.count;
+            self.trail64.truncate(sv.off64);
+            self.trail32.truncate(sv.off32);
+            self.trail16.truncate(sv.off16);
         }
-        for cid in frame.set_cells {
-            self.cell_letter[cid] = None;
+        for i in frame.cells..self.trail_cells.len() {
+            self.cell_letter[self.trail_cells[i]] = None;
         }
+        self.trail_cells.truncate(frame.cells);
         if self.avoid_substrings > 0 {
-            let letters = self.wl.len_data(frame.len).letters[frame.word].to_vec();
-            self.pop_grams(&letters);
+            let letters = self.wl.len_data(frame.len).word_letters(frame.word);
+            self.pop_grams(letters);
         }
         self.used[frame.len].clear(frame.word);
         self.assigned[frame.entry] = None;

@@ -55,7 +55,7 @@ fn main() {
             }
         };
         for (w, score) in found.iter().take(limit) {
-            match clues.get(w).first().filter(|_| show_clues) {
+            match clues.get(w).next().filter(|_| show_clues) {
                 Some(c) => println!("{w:<16} {score:>3}  {c}"),
                 None => println!("{w:<16} {score:>3}"),
             }

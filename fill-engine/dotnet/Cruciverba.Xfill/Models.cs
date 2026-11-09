@@ -55,7 +55,7 @@ public sealed record GenerateRequest
     public Symmetry? Symmetry { get; init; }
     /// <summary>Seed: same seed and request give the same grid.</summary>
     public ulong? Seed { get; init; }
-    /// <summary>Worker threads (0 = one per CPU).</summary>
+    /// <summary>Worker threads (0 = automatic: one per grid of the pool, at most one per CPU).</summary>
     public int? Threads { get; init; }
     /// <summary>Patterns to try at most.</summary>
     public int? Candidates { get; init; }

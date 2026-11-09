@@ -5,42 +5,187 @@
 //! many distinct clues it has: words clued many times are the ones setters
 //! actually use. 1 clue → 50, 3 → 63, 10 → 78, capped at 90.
 
-use crate::wordlist::{blocklist_beside, Wordlist};
-use std::collections::HashMap;
+use crate::wordlist::{blocklist_beside, Wordlist, MAX_LEN};
 use std::fs;
 
 /// Clues per normalized answer (A–Z), in file order, deduplicated.
+///
+/// Stored compactly (a handful of allocations whatever the size): the
+/// answers sorted and concatenated, the clue texts concatenated answer by
+/// answer, and u32 offsets into both.
+#[derive(Default)]
 pub struct ClueDb {
-    clues: HashMap<String, Vec<String>>,
+    /// answer i = `answers[aoff[i]..aoff[i + 1]]`, sorted
+    answers: String,
+    aoff: Vec<u32>,
+    /// clues of answer i = clue indices `first[i]..first[i + 1]`
+    first: Vec<u32>,
+    /// clue j = `text[coff[j]..coff[j + 1]]`
+    text: String,
+    coff: Vec<u32>,
 }
 
 impl ClueDb {
-    pub fn get(&self, answer: &str) -> &[String] {
-        self.clues.get(answer).map(|v| v.as_slice()).unwrap_or(&[])
+    /// Parse `WORD,clue` CSV bytes (UTF-8 or Latin-1 per line, optional
+    /// BOM, CRLF). Lines without a comma, with an empty/unusable word, or
+    /// `#` comments are skipped; an answer whose lines carry no clue text is
+    /// kept with no clues.
+    pub fn from_csv_bytes(bytes: &[u8]) -> ClueDb {
+        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        // Every buffer is sized exactly by a first pass, so loading never
+        // holds more than the final database plus a 12-byte index per line
+        // and the normalized answers.
+        let mut line_buf = String::new();
+        let mut word_buf = String::new();
+        let (mut n_lines, mut answer_bytes, mut clue_bytes) = (0usize, 0usize, 0usize);
+        for raw in bytes.split(|&b| b == b'\n') {
+            let Some((word, clue)) = split_line(raw, &mut line_buf) else {
+                continue;
+            };
+            word_buf.clear();
+            if normalize_answer_into(word.trim(), &mut word_buf) {
+                n_lines += 1;
+                answer_bytes += word_buf.len();
+                clue_bytes += clue.trim().trim_matches('"').trim().len();
+            }
+        }
+        // pass 1: normalized answers (concatenated) and the line of each:
+        // (answer offset, answer length, line start)
+        let mut abuf = String::with_capacity(answer_bytes);
+        let mut idx: Vec<(u32, u32, u32)> = Vec::with_capacity(n_lines);
+        let mut at = 0usize;
+        for raw in bytes.split(|&b| b == b'\n') {
+            let start = at;
+            at += raw.len() + 1;
+            let Some((word, _)) = split_line(raw, &mut line_buf) else {
+                continue;
+            };
+            let a0 = abuf.len();
+            if !normalize_answer_into(word.trim(), &mut abuf) {
+                abuf.truncate(a0);
+                continue;
+            }
+            idx.push((a0 as u32, (abuf.len() - a0) as u32, start as u32));
+        }
+        let ans = |e: &(u32, u32, u32)| &abuf[e.0 as usize..(e.0 + e.1) as usize];
+        // group by answer, file order within a group
+        idx.sort_unstable_by(|a, b| ans(a).cmp(ans(b)).then(a.2.cmp(&b.2)));
+        let (mut n_answers, mut unique_bytes) = (0usize, 0usize);
+        for (k, e) in idx.iter().enumerate() {
+            if k == 0 || ans(&idx[k - 1]) != ans(e) {
+                n_answers += 1;
+                unique_bytes += e.1 as usize;
+            }
+        }
+        // pass 2: answers, then their clues decoded straight into place
+        let mut db = ClueDb {
+            answers: String::with_capacity(unique_bytes),
+            aoff: Vec::with_capacity(n_answers + 1),
+            first: Vec::with_capacity(n_answers + 1),
+            text: String::with_capacity(clue_bytes),
+            coff: Vec::with_capacity(n_lines + 1),
+        };
+        db.coff.push(0);
+        db.aoff.push(0);
+        let mut i = 0;
+        while i < idx.len() {
+            let a = ans(&idx[i]);
+            db.answers.push_str(a);
+            db.aoff.push(db.answers.len() as u32);
+            db.first.push((db.coff.len() - 1) as u32);
+            let group_start = db.coff.len() - 1;
+            while i < idx.len() && ans(&idx[i]) == a {
+                let ls = idx[i].2 as usize;
+                i += 1;
+                let le = bytes[ls..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(bytes.len(), |n| ls + n);
+                let Some((_, clue)) = split_line(&bytes[ls..le], &mut line_buf) else {
+                    continue;
+                };
+                let clue = clue.trim().trim_matches('"').trim();
+                let dup = (group_start..db.coff.len() - 1)
+                    .any(|j| &db.text[db.coff[j] as usize..db.coff[j + 1] as usize] == clue);
+                if !clue.is_empty() && !dup {
+                    db.text.push_str(clue);
+                    db.coff.push(db.text.len() as u32);
+                }
+            }
+        }
+        db.first.push((db.coff.len() - 1) as u32);
+        drop(idx);
+        drop(abuf);
+        // only repeated clues leave slack
+        db.text.shrink_to_fit();
+        db.coff.shrink_to_fit();
+        db
     }
 
+    fn answer(&self, i: usize) -> &str {
+        &self.answers[self.aoff[i] as usize..self.aoff[i + 1] as usize]
+    }
+
+    fn clues_of(&self, i: usize) -> impl ExactSizeIterator<Item = &str> + Clone + '_ {
+        (self.first[i] as usize..self.first[i + 1] as usize)
+            .map(move |j| &self.text[self.coff[j] as usize..self.coff[j + 1] as usize])
+    }
+
+    /// The clues of `answer` (normalized A–Z), in file order.
+    pub fn get(&self, answer: &str) -> impl ExactSizeIterator<Item = &str> + Clone + '_ {
+        let (mut lo, mut hi) = (0, self.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.answer(mid) < answer {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let r = if lo < self.len() && self.answer(lo) == answer {
+            self.first[lo] as usize..self.first[lo + 1] as usize
+        } else {
+            0..0
+        };
+        r.map(move |j| &self.text[self.coff[j] as usize..self.coff[j + 1] as usize])
+    }
+
+    /// Answers in order, with their number of clues.
+    pub fn answers(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+        (0..self.len()).map(move |i| (self.answer(i), self.clues_of(i).len()))
+    }
+
+    /// Number of answers.
     pub fn len(&self) -> usize {
-        self.clues.len()
+        self.first.len().saturating_sub(1)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clues.is_empty()
+        self.len() == 0
     }
 
-    /// Approximate heap memory held by the clues (bytes).
+    /// Heap memory held by the clues (bytes).
     pub fn heap_bytes(&self) -> usize {
-        let string = std::mem::size_of::<String>();
-        self.clues
-            .iter()
-            .map(|(k, v)| {
-                k.capacity()
-                    + string
-                    + std::mem::size_of::<Vec<String>>()
-                    + v.iter().map(|c| c.capacity() + string).sum::<usize>()
-            })
-            .sum::<usize>()
-            + self.clues.capacity() * std::mem::size_of::<usize>()
+        self.answers.capacity()
+            + self.text.capacity()
+            + 4 * (self.aoff.capacity() + self.first.capacity() + self.coff.capacity())
     }
+}
+
+/// Decode one CSV line (UTF-8 when valid, else Latin-1 — the dataset mixes
+/// both) into `buf` and split it at the first comma: (word, clue). `None`
+/// for comments and lines without a comma.
+fn split_line<'b>(raw: &[u8], buf: &'b mut String) -> Option<(&'b str, &'b str)> {
+    buf.clear();
+    match std::str::from_utf8(raw) {
+        Ok(s) => buf.push_str(s),
+        Err(_) => buf.extend(raw.iter().map(|&b| b as char)),
+    }
+    let line = buf.trim_end_matches('\r');
+    if line.trim_start().starts_with('#') {
+        return None;
+    }
+    line.split_once(',')
 }
 
 impl ClueDb {
@@ -50,16 +195,15 @@ impl ClueDb {
     /// Accents typed as apostrophes are restored (see [`fix_accents`]).
     pub fn pick_clue(&self, answer: &str, pick: impl FnOnce(usize) -> usize) -> Option<String> {
         let all = self.get(answer);
-        let no_answer =
-            |c: &&String| answer.len() < 3 || !normalize_letters_lossy(c).contains(answer);
+        let no_answer = |c: &&str| answer.len() < 3 || !normalize_letters_lossy(c).contains(answer);
         // Preference tiers: clean and answer-free → answer-free → anything.
-        let tiers: [Vec<&String>; 3] = [
-            all.iter()
+        let tiers: [Vec<&str>; 3] = [
+            all.clone()
                 .filter(no_answer)
                 .filter(|c| !looks_truncated(c))
                 .collect(),
-            all.iter().filter(no_answer).collect(),
-            all.iter().collect(),
+            all.clone().filter(no_answer).collect(),
+            all.collect(),
         ];
         let pool = tiers.into_iter().find(|t| !t.is_empty())?;
         let chosen = fix_accents(pool[pick(pool.len()) % pool.len()]);
@@ -185,6 +329,13 @@ pub fn score_from_clue_count(n: usize) -> u8 {
 /// character remains.
 pub fn normalize_answer(word: &str) -> Option<String> {
     let mut out = String::with_capacity(word.len());
+    normalize_answer_into(word, &mut out).then_some(out)
+}
+
+/// [`normalize_answer`] appending to `out`; false (with `out` partly
+/// written) when the word is unusable or empty.
+fn normalize_answer_into(word: &str, out: &mut String) -> bool {
+    let start = out.len();
     for ch in word.chars() {
         let base = match ch {
             'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' | 'À' | 'Á' | 'Â' | 'Ä' | 'Ã' | 'Å' => {
@@ -198,49 +349,11 @@ pub fn normalize_answer(word: &str) -> Option<String> {
             'ñ' | 'Ñ' => 'N',
             ' ' | '\'' | '’' | '-' | '.' => continue,
             c if c.is_ascii_alphabetic() => c.to_ascii_uppercase(),
-            _ => return None,
+            _ => return false,
         };
         out.push(base);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-/// Decode one line: UTF-8 when valid, else Latin-1 (the dataset mixes both).
-fn decode_line(raw: &[u8]) -> String {
-    match std::str::from_utf8(raw) {
-        Ok(s) => s.to_string(),
-        Err(_) => raw.iter().map(|&b| b as char).collect(),
-    }
-}
-
-/// Parse `WORD,clue` CSV text into (answer → clues). Lines without a comma,
-/// with an empty/unusable word, or `#` comments are skipped.
-pub fn parse_clue_csv(bytes: &[u8]) -> HashMap<String, Vec<String>> {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for raw in bytes.split(|&b| b == b'\n') {
-        let line = decode_line(raw);
-        let line = line.trim_end_matches('\r');
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        let Some((word, clue)) = line.split_once(',') else {
-            continue;
-        };
-        let Some(answer) = normalize_answer(word.trim()) else {
-            continue;
-        };
-        let clue = clue.trim().trim_matches('"').trim().to_string();
-        let list = map.entry(answer).or_default();
-        if !clue.is_empty() && !list.contains(&clue) {
-            list.push(clue);
-        }
-    }
-    map
+    out.len() > start
 }
 
 /// Load a clue CSV as both the fill wordlist (scores derived from clue
@@ -265,6 +378,15 @@ pub fn load_clue_csv_rebus(
     Ok(dictionary_from_csv(&bytes, min_score, &blocklist, rebus))
 }
 
+/// Letters 0..25 of an answer, inline.
+struct Code([u8; MAX_LEN + 1], usize);
+
+impl AsRef<[u8]> for Code {
+    fn as_ref(&self) -> &[u8] {
+        &self.0[..self.1]
+    }
+}
+
 /// Build the fill wordlist and the clue database from `WORD,clue` CSV
 /// bytes already in memory (see [`load_clue_csv`]).
 pub fn dictionary_from_csv(
@@ -273,18 +395,19 @@ pub fn dictionary_from_csv(
     blocklist: &std::collections::HashSet<Box<[u8]>>,
     rebus: &[String],
 ) -> (Wordlist, ClueDb) {
-    let clues = parse_clue_csv(bytes);
-    let mut dict = String::with_capacity(clues.len() * 12);
-    let mut answers: Vec<&String> = clues.keys().collect();
-    answers.sort();
-    for a in answers {
-        dict.push_str(a);
-        dict.push(';');
-        dict.push_str(&score_from_clue_count(clues[a].len()).to_string());
-        dict.push('\n');
-    }
-    let wl = Wordlist::from_str_rebus(&dict, min_score, blocklist, rebus);
-    (wl, ClueDb { clues })
+    let clues = ClueDb::from_csv_bytes(bytes);
+    let entries = clues.answers().map(|(a, n)| {
+        // letters on the stack (longer answers are cut to MAX_LEN + 1 and
+        // so still skipped by the list)
+        let mut code = Code([0; MAX_LEN + 1], 0);
+        for (i, b) in a.bytes().take(MAX_LEN + 1).enumerate() {
+            code.0[i] = b - b'A';
+            code.1 = i + 1;
+        }
+        (code, score_from_clue_count(n))
+    });
+    let wl = Wordlist::from_scored(entries, min_score, blocklist, rebus);
+    (wl, clues)
 }
 
 #[cfg(test)]
@@ -306,9 +429,11 @@ mod tests {
             b"\xEF\xBB\xBFAA,Alto Adige\r\nAA,Alto Adige\r\nAA,Ai lati dell'aula\r\n".to_vec();
         bytes.extend_from_slice(b"ETA,Et\xe0\r\n"); // Latin-1 'à'
         bytes.extend_from_slice(b"senza virgola\r\n,clue senza parola\r\n");
-        let m = parse_clue_csv(&bytes);
-        assert_eq!(m["AA"], vec!["Alto Adige", "Ai lati dell'aula"]);
-        assert_eq!(m["ETA"], vec!["Età"]);
+        let m = ClueDb::from_csv_bytes(&bytes);
+        let get = |a: &str| m.get(a).collect::<Vec<_>>();
+        assert_eq!(get("AA"), vec!["Alto Adige", "Ai lati dell'aula"]);
+        assert_eq!(get("ETA"), vec!["Età"]);
+        assert!(get("ZZ").is_empty());
         assert_eq!(m.len(), 2);
     }
 
@@ -341,9 +466,7 @@ mod tests {
 
     #[test]
     fn pick_clue_avoids_answer_in_clue() {
-        let db = ClueDb {
-            clues: parse_clue_csv(b"MARE,Il mare blu\nMARE,Distesa salata\n"),
-        };
+        let db = ClueDb::from_csv_bytes(b"MARE,Il mare blu\nMARE,Distesa salata\n");
         for k in 0..4 {
             assert_eq!(
                 db.pick_clue("MARE", |_| k).as_deref(),
@@ -355,9 +478,8 @@ mod tests {
 
     #[test]
     fn pick_clue_prefers_complete_clues_and_capitalizes() {
-        let db = ClueDb {
-            clues: parse_clue_csv(b"ABBA,Un\nABBA,Erano duecento n\nABBA,e' un gruppo svedese\n"),
-        };
+        let db =
+            ClueDb::from_csv_bytes(b"ABBA,Un\nABBA,Erano duecento n\nABBA,e' un gruppo svedese\n");
         for k in 0..3 {
             assert_eq!(
                 db.pick_clue("ABBA", |_| k).as_deref(),
@@ -365,9 +487,7 @@ mod tests {
             );
         }
         // only truncated clues available → still returns one
-        let db = ClueDb {
-            clues: parse_clue_csv(b"ACA,Un\n"),
-        };
+        let db = ClueDb::from_csv_bytes(b"ACA,Un\n");
         assert_eq!(db.pick_clue("ACA", |_| 0).as_deref(), Some("Un"));
     }
 
@@ -406,11 +526,11 @@ mod tests {
 
     #[test]
     fn two_letter_words_are_loadable() {
-        let m = parse_clue_csv(b"TI,Pronome\nCASA,Abitazione\n");
+        let m = ClueDb::from_csv_bytes(b"TI,Pronome\nCASA,Abitazione\n");
         assert_eq!(m.len(), 2);
         let mut dict = String::new();
-        for (w, c) in &m {
-            dict.push_str(&format!("{};{}\n", w, score_from_clue_count(c.len())));
+        for (w, n) in m.answers() {
+            dict.push_str(&format!("{};{}\n", w, score_from_clue_count(n)));
         }
         let wl = Wordlist::from_str(&dict, 0);
         assert_eq!(wl.len_data(2).n, 1);

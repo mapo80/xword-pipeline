@@ -1,0 +1,11 @@
+[package]
+name = "xfill-perf"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "Benchmarks and profiling harnesses of the engine (see docs/prestazioni.md)"
+
+[dependencies]
+xfill-core = { path = "../xfill-core" }
+dhat = "=0.3.3"

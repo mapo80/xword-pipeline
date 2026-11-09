@@ -94,7 +94,8 @@ pub struct GenerateRequest {
     /// Seed: same seed and request give the same result (with a node
     /// budget), whatever the number of threads.
     pub seed: u64,
-    /// Worker threads (0 = one per CPU).
+    /// Worker threads (0 = automatic: one per grid of the pool, at most
+    /// one per CPU).
     pub threads: usize,
     /// Patterns to generate and try at most.
     pub candidates: usize,
@@ -476,7 +477,9 @@ pub fn fill_patterns(
     });
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
+    // raised once the pool is complete: the fills still running can only
+    // be dropped, so they stop at their next check
+    let stop = Arc::new(AtomicBool::new(false));
     let threads = plan.threads.clamp(1, n.max(1));
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -493,10 +496,11 @@ pub fn fill_patterns(
                 let cfg = SolveConfig {
                     seed: *jseed,
                     cancel: Some(cancel.clone()),
+                    halt: Some(stop.clone()),
                     ..plan.solve.clone()
                 };
                 let r = Solver::new(&p, wl).solve(&cfg);
-                if cancel.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
                     break; // the result may be cut short: don't count it
                 }
                 let grid = build_lib_grid(&p, &r);
@@ -635,8 +639,17 @@ pub fn plan_for(wl: &Wordlist, req: &GenerateRequest) -> Result<(Plan, usize), S
         lattice: req.lattice,
         ..ItGenConfig::new(req.rows, req.cols, blocks)
     };
+    let stop_after = req.pool.unwrap_or(if found > 0 {
+        DEFAULT_THEME_POOL
+    } else {
+        DEFAULT_POOL
+    });
+    // automatic: one thread per grid of the pool (more threads would fill
+    // patterns whose grids are dropped: CPU and memory for nothing)
     let threads = match req.threads {
-        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        0 => std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(stop_after),
         t => t,
     };
     Ok((
@@ -647,11 +660,7 @@ pub fn plan_for(wl: &Wordlist, req: &GenerateRequest) -> Result<(Plan, usize), S
             gen_tries: API_GEN_TRIES,
             min_mean: req.min_mean,
             max_weak: req.max_weak.unwrap_or(usize::MAX),
-            stop_after: req.pool.unwrap_or(if found > 0 {
-                DEFAULT_THEME_POOL
-            } else {
-                DEFAULT_POOL
-            }),
+            stop_after,
             threads,
             seed: req.seed,
         },
@@ -1196,6 +1205,72 @@ mod tests {
     }
 
     /// Cancelling stops a long generation quickly.
+    #[test]
+    fn automatic_threads_are_one_per_grid_of_the_pool() {
+        let d = dict();
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let plan = |req: GenerateRequest| plan_for(&d.words, &req).expect("plan").0;
+        // threads beyond the pool fill patterns whose grids are then dropped
+        assert_eq!(plan(small(7, 7)).threads, 3.min(cpus)); // pool 3
+        assert_eq!(
+            plan(GenerateRequest::default()).threads,
+            DEFAULT_POOL.min(cpus)
+        );
+        let theme = GenerateRequest {
+            theme_words: vec!["ARIA".into()],
+            ..Default::default()
+        };
+        assert_eq!(plan(theme).threads, DEFAULT_THEME_POOL.min(cpus));
+        // an explicit count is kept
+        assert_eq!(
+            plan(GenerateRequest {
+                threads: 7,
+                ..Default::default()
+            })
+            .threads,
+            7
+        );
+    }
+
+    #[test]
+    fn a_complete_pool_stops_the_fills_in_flight() {
+        // 3000 random 6-letter words: a one-row pattern fills at once, an
+        // open 6×6 keeps the solver busy until its time limit
+        let mut rng = Rng::new(11);
+        let mut text = String::new();
+        for _ in 0..3000 {
+            let w: String = (0..6)
+                .map(|_| (b'A' + rng.below(26) as u8) as char)
+                .collect();
+            text.push_str(&format!("{w};60\n"));
+        }
+        let wl = Wordlist::from_str(&text, 0);
+        let req = GenerateRequest {
+            rows: 6,
+            cols: 6,
+            ..Default::default()
+        };
+        let (mut plan, _) = plan_for(&wl, &req).expect("plan");
+        plan.stop_after = 2;
+        plan.threads = 4;
+        plan.solve.node_limit = 0;
+        plan.solve.time_limit_s = 4.0;
+        // the one-row pattern is done at its first fill
+        plan.solve.stop_on_first = true;
+        let easy = "......".to_string();
+        let hard = ["......"; 6].join("\n");
+        let jobs = vec![(easy.clone(), 1), (easy, 2), (hard.clone(), 3), (hard, 4)];
+        let t = Instant::now();
+        let run = fill_patterns(&wl, &plan, &jobs, &cancel_flag(), &|_, _| {});
+        assert_eq!(run.kept.len(), 2);
+        assert_eq!(run.done, 2);
+        assert!(
+            t.elapsed() < Duration::from_millis(1000),
+            "the fills started after the pool was complete ran for {:?}",
+            t.elapsed()
+        );
+    }
+
     #[test]
     fn cancellation_stops_quickly() {
         let d = dict();

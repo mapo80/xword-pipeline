@@ -12,6 +12,7 @@ crates/
   xfill-cli/    binari: xfill, library, bench, parole
   xfill-ffi/    interfaccia C (libreria xfill: xfill.dll / libxfill.so /
                 libxfill.dylib), header include/xfill.h generato da cbindgen
+  xfill-perf/   benchmark e profilazione (quick, gen, heap), non pubblicato
 dotnet/         SDK .NET Cruciverba.Xfill, test, esempio (vedi dotnet/README.md)
 bench/temi/     liste a tema di prova per `bench --theme`
 docs/           piano degli algoritmi e registro dei lavori
@@ -21,6 +22,8 @@ Dipendenze: `serde`/`serde_json` (contratto JSON dell'API); il resto è
 scritto da zero.
 
 Piano, scelte e risultati dei benchmark: [docs/piano-algoritmi.md](docs/piano-algoritmi.md).
+Memoria, CPU e velocità (misure, strumenti, procedura per ripeterle):
+[docs/prestazioni.md](docs/prestazioni.md).
 
 ## Algoritmi
 
@@ -112,6 +115,12 @@ let res = xfill_core::api::generate(&dict, &req, &xfill_core::api::cancel_flag()
   candidati provati) il risultato dipende solo da seme e richiesta, con
   qualunque numero di thread; `time_per_grid_s` resta un tetto di sicurezza.
 - `CancelFlag` (`Arc<AtomicBool>`) ferma la generazione in pochi ms.
+- `threads: 0` (default) = un thread per griglia del pool (2, o 4 con parole a
+  tema), al massimo uno per CPU: altri thread riempirebbero schemi poi
+  scartati.
+- Memoria: il dizionario Db.csv occupa circa 4 MB (caricamento in circa 40 ms,
+  picco 4,5 MB oltre ai byte del CSV); ogni thread di riempimento circa 1 MB.
+  Per lunghezza si tengono al massimo 65.535 parole, le migliori.
 - `validate` controlla numerazione, coordinate, incroci, risposte rispetto
   alla griglia, parole ripetute, definizioni che contengono la risposta.
 

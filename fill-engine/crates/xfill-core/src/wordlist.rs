@@ -6,7 +6,6 @@
 //! the highest-quality entry. This makes score-ordered enumeration (iterate set
 //! bits low→high) and quality tiers (an index cutoff) fall out for free.
 
-use crate::bitset::Bitset;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -18,6 +17,9 @@ pub const MAX_LEN: usize = 24;
 /// answers; a 1-letter run is an unclued cell (it belongs only to the
 /// perpendicular entry), which `grid::Puzzle` already models.
 pub const MIN_LEN: usize = 2;
+/// Words kept per length (the best ones): the solver counts candidates per
+/// (position, letter) in 16 bits, which halves its search memory.
+pub const MAX_WORDS_PER_LEN: usize = u16::MAX as usize;
 /// Symbols per cell: 26 letters plus up to 6 rebus strings.
 pub const ALPHA: usize = 32;
 /// Symbol of the first rebus string (letters are 0..26).
@@ -68,19 +70,29 @@ pub(crate) fn blocklist_beside(wordlist_path: &str) -> HashSet<Box<[u8]>> {
 pub struct LenData {
     pub len: usize,
     pub n: usize,
-    pub letters: Vec<Box<[u8]>>, // [word][pos] = 0..25
+    /// Letters, contiguous: word `w` is `flat[w * len..(w + 1) * len]`
+    /// (symbols 0..25 = A..Z, then rebus symbols).
+    pub flat: Vec<u8>,
     pub scores: Vec<u8>,
-    /// compat[pos * 26 + c] = bitset of words with letter c at pos.
-    pub compat: Vec<Bitset>,
-    /// pos_count[pos * 26 + c] = number of words with letter c at pos
+    /// Compatibility masks, one block run per (position, symbol) with at
+    /// least one word: bitset of the words with symbol c at pos. Runs of
+    /// `blocks_per_mask` u64 each; offset 0 is an all-zero run shared by
+    /// every absent (position, symbol).
+    compat_blocks: Vec<u64>,
+    /// compat_off[pos * ALPHA + c] = start of its run in `compat_blocks`.
+    compat_off: Vec<u32>,
+    blocks_per_mask: usize,
+    /// pos_count[pos * ALPHA + c] = number of words with letter c at pos
     /// (cheap O(1) least-constraining-value signal).
     pub pos_count: Vec<u32>,
 }
 
 impl LenData {
+    /// Words with symbol `c` at `pos`, as 64-bit blocks (bit w = word w).
     #[inline]
-    pub fn compat(&self, pos: usize, c: u8) -> &Bitset {
-        &self.compat[pos * ALPHA + c as usize]
+    pub fn compat(&self, pos: usize, c: u8) -> &[u64] {
+        let off = self.compat_off[pos * ALPHA + c as usize] as usize;
+        &self.compat_blocks[off..off + self.blocks_per_mask]
     }
 
     #[inline]
@@ -105,8 +117,14 @@ impl LenData {
         lo
     }
 
+    /// Letters of word `i`.
+    #[inline]
+    pub fn word_letters(&self, i: usize) -> &[u8] {
+        &self.flat[i * self.len..(i + 1) * self.len]
+    }
+
     pub fn word_string(&self, i: usize) -> String {
-        self.letters[i]
+        self.word_letters(i)
             .iter()
             .map(|&b| (b'A' + b) as char)
             .collect()
@@ -115,7 +133,56 @@ impl LenData {
     /// Index of an exact word (letters 0..25) in this length bucket, if present.
     /// Linear scan — intended for the handful of theme answers, not hot paths.
     pub fn index_of(&self, letters: &[u8]) -> Option<usize> {
-        self.letters.iter().position(|w| w.as_ref() == letters)
+        if letters.len() != self.len || self.len == 0 {
+            return None;
+        }
+        self.flat.chunks_exact(self.len).position(|w| w == letters)
+    }
+
+    /// Words sorted by score (descending, then letters) → per-length data.
+    fn build(len: usize, flat: Vec<u8>, scores: Vec<u8>) -> LenData {
+        let n = scores.len();
+        let nb = n.div_ceil(64).max(1);
+        let n_masks = if len >= MIN_LEN { len * ALPHA } else { 0 };
+        let mut pos_count = vec![0u32; n_masks];
+        for (p_c, &c) in flat.iter().enumerate() {
+            pos_count[(p_c % len) * ALPHA + c as usize] += 1;
+        }
+        let mut compat_off = vec![0u32; n_masks];
+        let mut next = nb; // run 0 = the shared zeros
+        for (i, &k) in pos_count.iter().enumerate() {
+            if k > 0 {
+                compat_off[i] = next as u32;
+                next += nb;
+            }
+        }
+        let mut compat_blocks = vec![0u64; next];
+        for w in 0..n {
+            for p in 0..len {
+                let c = flat[w * len + p] as usize;
+                let off = compat_off[p * ALPHA + c] as usize;
+                compat_blocks[off + (w >> 6)] |= 1u64 << (w & 63);
+            }
+        }
+        LenData {
+            len,
+            n,
+            flat,
+            scores,
+            compat_blocks,
+            compat_off,
+            blocks_per_mask: nb,
+            pos_count,
+        }
+    }
+
+    /// Heap memory (bytes).
+    fn heap_bytes(&self) -> usize {
+        self.flat.capacity()
+            + self.scores.capacity()
+            + self.compat_blocks.capacity() * 8
+            + self.compat_off.capacity() * 4
+            + self.pos_count.capacity() * 4
     }
 }
 
@@ -139,125 +206,134 @@ impl Wordlist {
         Self::from_str_rebus(text, min_score, blocklist, &[])
     }
 
-    /// Like `from_str_filtered`, plus rebus variants: for each rebus string
-    /// R (at most `ALPHA - 26`) every word containing R also enters as a
-    /// variant with that occurrence replaced by R's single-cell symbol (same
-    /// score). `word()` spells variants back with the full string.
+    /// `WORD;score` lines (other lines and non-letter words are skipped);
+    /// see [`Wordlist::from_scored`].
     pub fn from_str_rebus(
         text: &str,
         min_score: u8,
         blocklist: &HashSet<Box<[u8]>>,
         rebus: &[String],
     ) -> Wordlist {
+        let entries = text.lines().filter_map(|line| {
+            let (word, score_s) = line.trim().split_once(';')?;
+            let score: u8 = match score_s.trim().parse::<i32>() {
+                Ok(s) if s >= 0 => s.min(100) as u8,
+                _ => return None,
+            };
+            let mut letters: Vec<u8> = Vec::with_capacity(word.len());
+            for ch in word.chars() {
+                let up = ch.to_ascii_uppercase();
+                if !up.is_ascii_uppercase() {
+                    return None;
+                }
+                letters.push(up as u8 - b'A');
+            }
+            Some((letters, score))
+        });
+        Self::from_scored(entries, min_score, blocklist, rebus)
+    }
+
+    /// Build the list from (letters 0..25, score) entries. Words outside
+    /// MIN_LEN..=MAX_LEN or in `blocklist` are skipped; of repeated words the
+    /// first occurrence wins (a later duplicate never overrides it), then
+    /// words scoring below `min_score` are dropped. For each rebus string R
+    /// (at most `ALPHA - 26`) every kept word containing R also enters as a
+    /// variant with that occurrence replaced by R's single-cell symbol (same
+    /// score); `word()` spells variants back with the full string.
+    pub fn from_scored<I, A>(
+        entries: I,
+        min_score: u8,
+        blocklist: &HashSet<Box<[u8]>>,
+        rebus: &[String],
+    ) -> Wordlist
+    where
+        I: IntoIterator<Item = (A, u8)>,
+        A: AsRef<[u8]>,
+    {
         let rebus: Vec<String> = rebus
             .iter()
             .map(|r| r.to_ascii_uppercase())
             .take(ALPHA - REBUS_BASE as usize)
             .collect();
-        // collect (letters, score) per length
-        let mut buckets: Vec<Vec<(Box<[u8]>, u8)>> = (0..=MAX_LEN).map(|_| Vec::new()).collect();
-        let mut seen: HashSet<Box<[u8]>> = HashSet::new();
-
-        for line in text.lines() {
-            let line = line.trim();
-            let Some((word, score_s)) = line.split_once(';') else {
-                continue;
-            };
-            let score: u8 = match score_s.trim().parse::<i32>() {
-                Ok(s) if s >= 0 => s.min(100) as u8,
-                _ => continue,
-            };
-            let mut letters: Vec<u8> = Vec::with_capacity(word.len());
-            let mut ok = true;
-            for ch in word.chars() {
-                let up = ch.to_ascii_uppercase();
-                if up.is_ascii_uppercase() {
-                    letters.push(up as u8 - b'A');
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if !ok {
+        // per length: letters (contiguous) and (score, input order)
+        let mut flat: Vec<Vec<u8>> = (0..=MAX_LEN).map(|_| Vec::new()).collect();
+        let mut meta: Vec<Vec<(u8, u32)>> = (0..=MAX_LEN).map(|_| Vec::new()).collect();
+        for (order, (w, score)) in entries.into_iter().enumerate() {
+            let w = w.as_ref();
+            let len = w.len();
+            if !(MIN_LEN..=MAX_LEN).contains(&len) || blocklist.contains(w) {
                 continue;
             }
-            let len = letters.len();
-            if !(MIN_LEN..=MAX_LEN).contains(&len) {
-                continue;
-            }
-            let boxed: Box<[u8]> = letters.into_boxed_slice();
-            if blocklist.contains(&boxed) {
-                continue;
-            }
-            // First occurrence wins; a later duplicate never overrides it.
-            if seen.contains(&boxed) {
-                continue;
-            }
-            seen.insert(boxed.clone());
-            if score < min_score {
-                continue;
-            }
-            buckets[len].push((boxed, score));
+            flat[len].extend_from_slice(w);
+            meta[len].push((score, order as u32));
         }
-
-        // rebus variants
+        // dedup (first occurrence wins), then the score floor
+        let mut kept: Vec<Vec<(u32, u8)>> = (0..=MAX_LEN).map(|_| Vec::new()).collect();
+        for len in MIN_LEN..=MAX_LEN {
+            let f = &flat[len];
+            let word = |i: u32| &f[i as usize * len..(i as usize + 1) * len];
+            let mut idx: Vec<u32> = (0..meta[len].len() as u32).collect();
+            idx.sort_unstable_by(|&a, &b| {
+                word(a)
+                    .cmp(word(b))
+                    .then(meta[len][a as usize].1.cmp(&meta[len][b as usize].1))
+            });
+            idx.dedup_by(|b, a| word(*a) == word(*b));
+            kept[len] = idx
+                .into_iter()
+                .map(|i| (i, meta[len][i as usize].0))
+                .filter(|&(_, sc)| sc >= min_score)
+                .collect();
+            meta[len] = Vec::new();
+        }
+        // rebus variants of the kept words (a variant holds a rebus symbol,
+        // so it can't repeat a word; one per occurrence of the string)
         for (k, r) in rebus.iter().enumerate() {
             let rl = normalize_letters(r);
             if rl.len() < 2 {
                 continue;
             }
             let sym = REBUS_BASE + k as u8;
-            let originals: Vec<(Box<[u8]>, u8)> = buckets.iter().flatten().cloned().collect();
-            for (w, sc) in originals {
-                if w.iter().any(|&c| c >= REBUS_BASE) {
+            for len in MIN_LEN..=MAX_LEN {
+                if len < rl.len() {
                     continue;
                 }
-                for i in 0..=w.len().saturating_sub(rl.len()) {
-                    if w.len() < rl.len() || w[i..i + rl.len()] != rl[..] {
+                let vlen = len + 1 - rl.len();
+                for j in 0..kept[len].len() {
+                    let (i, sc) = kept[len][j];
+                    let w = flat[len][i as usize * len..(i as usize + 1) * len].to_vec();
+                    if w.iter().any(|&c| c >= REBUS_BASE) {
                         continue;
                     }
-                    let v: Vec<u8> = w[..i]
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(sym))
-                        .chain(w[i + rl.len()..].iter().copied())
-                        .collect();
-                    let boxed: Box<[u8]> = v.into_boxed_slice();
-                    if (MIN_LEN..=MAX_LEN).contains(&boxed.len()) && seen.insert(boxed.clone()) {
-                        buckets[boxed.len()].push((boxed, sc));
+                    for at in 0..=len - rl.len() {
+                        if w[at..at + rl.len()] != rl[..] || vlen < MIN_LEN {
+                            continue;
+                        }
+                        let vi = (flat[vlen].len() / vlen) as u32;
+                        flat[vlen].extend_from_slice(&w[..at]);
+                        flat[vlen].push(sym);
+                        flat[vlen].extend_from_slice(&w[at + rl.len()..]);
+                        kept[vlen].push((vi, sc));
                     }
                 }
             }
         }
 
         let mut by_len: Vec<LenData> = Vec::with_capacity(MAX_LEN + 1);
-        for (len, mut entries) in buckets.into_iter().enumerate() {
+        for len in 0..=MAX_LEN {
+            let f = std::mem::take(&mut flat[len]);
+            let mut k = std::mem::take(&mut kept[len]);
+            let word = |i: u32| &f[i as usize * len..(i as usize + 1) * len];
             // score desc, tie-break by letters asc for determinism
-            entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let n = entries.len();
-            let mut letters = Vec::with_capacity(n);
-            let mut scores = Vec::with_capacity(n);
-            for (w, s) in entries {
-                letters.push(w);
-                scores.push(s);
+            k.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| word(a.0).cmp(word(b.0))));
+            k.truncate(MAX_WORDS_PER_LEN);
+            let mut out = Vec::with_capacity(k.len() * len);
+            for &(i, _) in &k {
+                out.extend_from_slice(word(i));
             }
-            // build compat masks
-            let n_masks = if len >= MIN_LEN { len * ALPHA } else { 0 };
-            let mut compat: Vec<Bitset> = (0..n_masks).map(|_| Bitset::zeros(n.max(1))).collect();
-            for (i, w) in letters.iter().enumerate() {
-                for (p, &c) in w.iter().enumerate() {
-                    compat[p * ALPHA + c as usize].set(i);
-                }
-            }
-            let pos_count: Vec<u32> = compat.iter().map(|b| b.count_ones()).collect();
-            by_len.push(LenData {
-                len,
-                n,
-                letters,
-                scores,
-                compat,
-                pos_count,
-            });
+            let scores = k.iter().map(|&(_, sc)| sc).collect();
+            drop(f);
+            by_len.push(LenData::build(len, out, scores));
         }
 
         Wordlist { by_len, rebus }
@@ -265,16 +341,15 @@ impl Wordlist {
 
     /// Word `i` of length `len`, with rebus symbols spelled out.
     pub fn word(&self, len: usize, i: usize) -> String {
-        self.len_data(len).letters[i]
-            .iter()
-            .map(|&c| {
-                if c < REBUS_BASE {
-                    ((b'A' + c) as char).to_string()
-                } else {
-                    self.rebus[(c - REBUS_BASE) as usize].clone()
-                }
-            })
-            .collect()
+        let mut out = String::with_capacity(len);
+        for &c in self.len_data(len).word_letters(i) {
+            if c < REBUS_BASE {
+                out.push((b'A' + c) as char);
+            } else {
+                out.push_str(&self.rebus[(c - REBUS_BASE) as usize]);
+            }
+        }
+        out
     }
 
     #[inline]
@@ -287,21 +362,10 @@ impl Wordlist {
         self.by_len.iter().map(|l| l.n).sum()
     }
 
-    /// Approximate heap memory held by the list and its masks (bytes).
+    /// Heap memory held by the list and its masks (bytes).
     pub fn heap_bytes(&self) -> usize {
-        self.by_len
-            .iter()
-            .map(|l| {
-                l.letters.iter().map(|w| w.len()).sum::<usize>()
-                    + l.letters.capacity() * std::mem::size_of::<Box<[u8]>>()
-                    + l.scores.capacity()
-                    + l.compat
-                        .iter()
-                        .map(|b| b.heap_bytes() + std::mem::size_of::<crate::bitset::Bitset>())
-                        .sum::<usize>()
-                    + l.pos_count.capacity() * std::mem::size_of::<u32>()
-            })
-            .sum::<usize>()
+        self.by_len.iter().map(LenData::heap_bytes).sum::<usize>()
+            + self.by_len.capacity() * std::mem::size_of::<LenData>()
             + self.rebus.iter().map(String::capacity).sum::<usize>()
     }
 
@@ -374,7 +438,10 @@ FOO;25
         let l3 = wl.len_data(3);
         // words with 'A' (c=0) at pos 1: CAT, RAT(excluded) → just CAT among kept
         let mask = l3.compat(1, 0);
-        let hits: Vec<String> = mask.iter_ones().map(|i| l3.word_string(i)).collect();
+        let hits: Vec<String> = (0..l3.n)
+            .filter(|&i| (mask[i >> 6] >> (i & 63)) & 1 == 1)
+            .map(|i| l3.word_string(i))
+            .collect();
         assert!(hits.contains(&"CAT".to_string()));
         assert!(!hits.contains(&"DOG".to_string()));
     }
@@ -431,6 +498,26 @@ FOO;25
         // originals stay; words without RE get no variant
         assert!(l4.index_of(&normalize_letters("REDO")).is_some());
         assert!(wl.len_data(3).index_of(&normalize_letters("SOL")).is_none());
+    }
+
+    #[test]
+    fn a_length_keeps_at_most_max_words_the_best_ones() {
+        // 70,000 distinct 4-letter words; the solver counts supports in u16
+        let mut entries: Vec<(Vec<u8>, u8)> = Vec::new();
+        for i in 0..70_000u32 {
+            let w = vec![
+                (i % 26) as u8,
+                (i / 26 % 26) as u8,
+                (i / 676 % 26) as u8,
+                (i / 17_576) as u8,
+            ];
+            // the last 4,465 words score lowest
+            entries.push((w, if i < MAX_WORDS_PER_LEN as u32 { 60 } else { 10 }));
+        }
+        let wl = Wordlist::from_scored(entries, 0, &HashSet::new(), &[]);
+        let l4 = wl.len_data(4);
+        assert_eq!(l4.n, MAX_WORDS_PER_LEN);
+        assert!(l4.scores.iter().all(|&s| s == 60));
     }
 
     #[test]
