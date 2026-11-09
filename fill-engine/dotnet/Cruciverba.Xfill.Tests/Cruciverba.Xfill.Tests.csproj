@@ -19,9 +19,10 @@
     <ProjectReference Include="../Cruciverba.Xfill/Cruciverba.Xfill.csproj" />
   </ItemGroup>
 
-  <!-- the native library just built by cargo -->
+  <!-- the engine library just built by cargo, and the host that runs it -->
   <ItemGroup>
     <None Include="$(XfillCargoTarget)/$(XfillNativeName)" CopyToOutputDirectory="PreserveNewest" Link="$(XfillNativeName)" />
+    <None Include="$(XfillCargoTarget)/$(XfillHostName)" CopyToOutputDirectory="PreserveNewest" Link="$(XfillHostName)" />
   </ItemGroup>
 
 </Project>

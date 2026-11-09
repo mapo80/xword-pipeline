@@ -803,15 +803,80 @@ fn present_symbols(wl: &Wordlist) -> Vec<u32> {
     out
 }
 
+/// Elements per chunk of an [`Arena`] (every snapshot fits in one: at most
+/// 1,024 domain blocks + culprits, 24 × 32 supports).
+const CHUNK: usize = 4096;
+
+/// A stack of snapshots in fixed-size chunks: pushing never reallocates
+/// (no transient copy of the whole stack) and at most one chunk is partly
+/// unused. A snapshot is contiguous: one that doesn't fit in the current
+/// chunk starts the next one.
+struct Arena<T> {
+    chunks: Vec<Box<[T]>>,
+    /// current chunk and position in it
+    cur: usize,
+    pos: usize,
+}
+
+impl<T> Default for Arena<T> {
+    fn default() -> Self {
+        Arena {
+            chunks: Vec::new(),
+            cur: 0,
+            pos: 0,
+        }
+    }
+}
+
+impl<T: Copy + Default> Arena<T> {
+    /// Push the concatenation of `parts`; returns its handle.
+    fn push(&mut self, parts: &[&[T]]) -> usize {
+        let n: usize = parts.iter().map(|p| p.len()).sum();
+        assert!(n <= CHUNK, "snapshot larger than a chunk");
+        if self.pos + n > CHUNK {
+            self.cur += 1;
+            self.pos = 0;
+        }
+        while self.chunks.len() <= self.cur {
+            self.chunks
+                .push(vec![T::default(); CHUNK].into_boxed_slice());
+        }
+        let at = self.cur * CHUNK + self.pos;
+        let chunk = &mut self.chunks[self.cur];
+        for p in parts {
+            chunk[self.pos..self.pos + p.len()].copy_from_slice(p);
+            self.pos += p.len();
+        }
+        at
+    }
+
+    /// The `len` elements pushed at handle `at`.
+    fn get(&self, at: usize, len: usize) -> &[T] {
+        let (c, o) = (at / CHUNK, at % CHUNK);
+        &self.chunks[c][o..o + len]
+    }
+
+    /// Drop everything pushed from handle `at` on (chunks are kept).
+    fn truncate(&mut self, at: usize) {
+        self.cur = at / CHUNK;
+        self.pos = at % CHUNK;
+    }
+
+    fn clear(&mut self) {
+        self.truncate(0);
+    }
+}
+
 /// The domain data itself (blocks, culprits, masks, supports) lives in the
-/// solver's trail arenas at `off64` / `off32`, so saving allocates nothing.
+/// solver's trail arenas at `off64` / `off32` / `off16`, so saving
+/// allocates nothing.
 #[derive(Clone, Copy)]
 struct Saved {
-    entry: usize,
+    entry: u32,
     count: u32,
-    off64: usize,
-    off32: usize,
-    off16: usize,
+    off64: u32,
+    off32: u32,
+    off16: u32,
 }
 
 /// One assignment on the trail. Its snapshots are `trail[saved..]` and its
@@ -911,11 +976,11 @@ pub struct Solver<'a> {
     /// snapshots of the domains changed by the frames on the trail
     trail: Vec<Saved>,
     /// arena of the snapshots' 64-bit data (domain blocks, culprits)
-    trail64: Vec<u64>,
+    trail64: Arena<u64>,
     /// arena of the snapshots' masks
-    trail32: Vec<u32>,
+    trail32: Arena<u32>,
     /// arena of the snapshots' supports
-    trail16: Vec<u16>,
+    trail16: Arena<u16>,
     /// symbols per position in `support` (26 letters + the rebus strings)
     sym: usize,
     /// cells set by the frames on the trail
@@ -1087,9 +1152,9 @@ impl<'a> Solver<'a> {
             conflict: Bitset::zeros(n.max(1)),
             present: present_symbols(wl),
             trail: Vec::new(),
-            trail64: Vec::new(),
-            trail32: Vec::new(),
-            trail16: Vec::new(),
+            trail64: Arena::default(),
+            trail32: Arena::default(),
+            trail16: Arena::default(),
             sym: REBUS_BASE as usize + wl.rebus.len(),
             trail_cells: Vec::new(),
             scratch: Vec::new(),
@@ -2232,10 +2297,10 @@ impl<'a> Solver<'a> {
     fn frame_dead(&mut self, frame: &TrailFrame) -> bool {
         match self.trail[frame.saved..]
             .iter()
-            .find(|sv| self.dom_count[sv.entry] == 0)
+            .find(|sv| self.dom_count[sv.entry as usize] == 0)
         {
             Some(sv) => {
-                self.conflict.copy_from(&self.culprits[sv.entry]);
+                self.conflict.copy_from(&self.culprits[sv.entry as usize]);
                 true
             }
             None => false,
@@ -2789,18 +2854,17 @@ impl<'a> Solver<'a> {
     fn save(&mut self, _frame: &mut TrailFrame, e: usize) {
         if self.saved_in[e] != self.serial {
             self.saved_in[e] = self.serial;
-            let (off64, off32, off16) =
-                (self.trail64.len(), self.trail32.len(), self.trail16.len());
-            self.trail64.extend_from_slice(self.domains[e].blocks());
-            self.trail64.extend_from_slice(self.culprits[e].blocks());
-            self.trail32.extend_from_slice(&self.masks[e]);
-            self.trail16.extend_from_slice(&self.support[e]);
+            let off64 = self
+                .trail64
+                .push(&[self.domains[e].blocks(), self.culprits[e].blocks()]);
+            let off32 = self.trail32.push(&[&self.masks[e]]);
+            let off16 = self.trail16.push(&[&self.support[e]]);
             self.trail.push(Saved {
-                entry: e,
+                entry: e as u32,
                 count: self.dom_count[e],
-                off64,
-                off32,
-                off16,
+                off64: off64 as u32,
+                off32: off32 as u32,
+                off16: off16 as u32,
             });
         }
     }
@@ -2945,7 +3009,7 @@ impl<'a> Solver<'a> {
     /// wipeout (some entry left with no in-tier candidate).
     fn propagate(&mut self, frame: &mut TrailFrame) -> bool {
         for i in frame.saved..self.trail.len() {
-            let e = self.trail[i].entry;
+            let e = self.trail[i].entry as usize;
             if !self.in_queue[e] {
                 self.in_queue[e] = true;
                 self.queue.push_back(e);
@@ -3042,22 +3106,20 @@ impl<'a> Solver<'a> {
         // reverse order: an entry saved twice gets its oldest snapshot back
         while self.trail.len() > frame.saved {
             let sv = self.trail.pop().expect("trail");
-            let e = sv.entry;
+            let e = sv.entry as usize;
             let nb = self.domains[e].blocks().len();
             let nc = self.culprits[e].blocks().len();
-            let a = &self.trail64[sv.off64..];
+            let a = self.trail64.get(sv.off64 as usize, nb + nc);
             self.domains[e].blocks_mut().copy_from_slice(&a[..nb]);
-            self.culprits[e]
-                .blocks_mut()
-                .copy_from_slice(&a[nb..nb + nc]);
+            self.culprits[e].blocks_mut().copy_from_slice(&a[nb..]);
             let nm = self.masks[e].len();
             let ns = self.support[e].len();
-            self.masks[e].copy_from_slice(&self.trail32[sv.off32..sv.off32 + nm]);
-            self.support[e].copy_from_slice(&self.trail16[sv.off16..sv.off16 + ns]);
+            self.masks[e].copy_from_slice(self.trail32.get(sv.off32 as usize, nm));
+            self.support[e].copy_from_slice(self.trail16.get(sv.off16 as usize, ns));
             self.dom_count[e] = sv.count;
-            self.trail64.truncate(sv.off64);
-            self.trail32.truncate(sv.off32);
-            self.trail16.truncate(sv.off16);
+            self.trail64.truncate(sv.off64 as usize);
+            self.trail32.truncate(sv.off32 as usize);
+            self.trail16.truncate(sv.off16 as usize);
         }
         for i in frame.cells..self.trail_cells.len() {
             self.cell_letter[self.trail_cells[i]] = None;

@@ -43,6 +43,22 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --release
 
+      - name: xfill-host (C, -Werror) against the library
+        run: |
+          host/build.sh target/release
+          # protocol smoke test: the host loads the library and answers HELLO
+          python3 - <<'PY'
+          import struct, subprocess
+          p = subprocess.Popen(["target/release/xfill-host", "target/release/libxfill.so"],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+          kind, _, rc, la = struct.unpack("<BIiI", p.stdout.read(13))
+          version = p.stdout.read(la)
+          assert (kind, rc) == (0, 0), (kind, rc)
+          print("xfill-host ok, engine", version.decode())
+          p.stdin.close()
+          assert p.wait(10) == 0
+          PY
+
   ffi:
     name: xfill-ffi (coverage, header)
     runs-on: ubuntu-latest

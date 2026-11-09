@@ -14,5 +14,8 @@
     <XfillNativeName Condition="'$(XfillNativeName)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">xfill.dll</XfillNativeName>
     <XfillNativeName Condition="'$(XfillNativeName)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">libxfill.dylib</XfillNativeName>
     <XfillNativeName Condition="'$(XfillNativeName)' == ''">libxfill.so</XfillNativeName>
+    <!-- the process that runs the library (fill-engine/host/build.sh puts it next to it) -->
+    <XfillHostName Condition="'$(XfillHostName)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">xfill-host.exe</XfillHostName>
+    <XfillHostName Condition="'$(XfillHostName)' == ''">xfill-host</XfillHostName>
   </PropertyGroup>
 </Project>

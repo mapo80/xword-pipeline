@@ -17,11 +17,13 @@ pub mod grid;
 pub mod insight;
 pub mod library;
 pub mod llm;
+pub mod mapped;
 pub mod pdf;
 pub mod solver;
 pub mod util;
 pub mod wordlist;
 pub mod words;
+pub mod xfd;
 
 pub use grid::Puzzle;
 pub use solver::{solve_portfolio, Analysis, Lock, SolveConfig, SolveResult, Solver};

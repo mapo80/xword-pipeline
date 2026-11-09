@@ -12,6 +12,7 @@
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use xfill_core::api::{self, Dictionary, GenerateRequest, Status, ValidateInput};
+use xfill_core::xfd::OpenError;
 
 /// Success.
 pub const XFILL_OK: c_int = 0;
@@ -25,8 +26,11 @@ pub const XFILL_ERR_REQUEST: c_int = -3;
 pub const XFILL_ERR_PANIC: c_int = -4;
 /// The generation was cancelled through the cancellation flag.
 pub const XFILL_CANCELLED: c_int = -5;
-/// The dictionary CSV holds no usable word.
+/// No usable word in the CSV, or a dictionary file corrupted or of
+/// another format version.
 pub const XFILL_ERR_DATA: c_int = -6;
+/// A file can't be read or written.
+pub const XFILL_ERR_IO: c_int = -7;
 
 /// Opaque handle of a loaded dictionary (words, scores, clues).
 pub struct XfillWordlist {
@@ -43,35 +47,88 @@ pub extern "C" fn xfill_version() -> *const c_char {
     VERSION.as_ptr().cast()
 }
 
-/// Load a `WORD,clue` CSV from memory (UTF-8 or Latin-1). On success
-/// writes the handle to `*out` and returns [`XFILL_OK`]; on failure returns
-/// an error code and, if `err` is not null, writes a message to `*err`
-/// (free it with [`xfill_string_free`]).
+/// Build a dictionary file at `path` (UTF-8, NUL-terminated) from a
+/// `WORD,clue` CSV in memory (UTF-8 or Latin-1). The file is written
+/// atomically (never seen half-written) and holds the dictionary ready for
+/// [`xfill_dict_open`]. On success, if `stats_json` is not null, writes
+/// `{"words","bytes"}` there. Errors: [`XFILL_ERR_DATA`] (no usable word),
+/// [`XFILL_ERR_IO`] (the file can't be written), [`XFILL_ERR_ARG`], with a
+/// message in `*err` when `err` is not null.
 #[no_mangle]
-pub unsafe extern "C" fn xfill_wordlist_load_csv(
+pub unsafe extern "C" fn xfill_dict_build(
     csv: *const u8,
     len: usize,
-    out: *mut *mut XfillWordlist,
+    path: *const c_char,
+    stats_json: *mut *mut c_char,
     err: *mut *mut c_char,
 ) -> c_int {
     guard(err, || {
-        if out.is_null() || (csv.is_null() && len > 0) {
+        if path.is_null() || (csv.is_null() && len > 0) {
             set_err(err, "null pointer argument");
             return XFILL_ERR_ARG;
         }
+        // SAFETY: a NUL-terminated string from the caller
+        let Ok(path) = unsafe { CStr::from_ptr(path) }.to_str() else {
+            set_err(err, "path is not valid UTF-8");
+            return XFILL_ERR_ARG;
+        };
         let bytes: &[u8] = if len == 0 {
             &[]
         } else {
             // SAFETY: the caller passes `len` readable bytes at `csv`
             unsafe { std::slice::from_raw_parts(csv, len) }
         };
-        match Dictionary::from_csv_bytes(bytes) {
+        let dict = match Dictionary::from_csv_bytes(bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                set_err(err, &e);
+                return XFILL_ERR_DATA;
+            }
+        };
+        if let Err(e) = dict.save(std::path::Path::new(path)) {
+            set_err(err, &format!("cannot write {path}: {e}"));
+            return XFILL_ERR_IO;
+        }
+        if !stats_json.is_null() {
+            // SAFETY: checked non-null
+            unsafe { *stats_json = to_c_string(stats(&dict)) };
+        }
+        XFILL_OK
+    })
+}
+
+/// Open the dictionary file at `path` (written by [`xfill_dict_build`]):
+/// it is mapped and used in place — no parsing, no copy. On success writes
+/// the handle to `*out`. Errors: [`XFILL_ERR_IO`] (missing or unreadable),
+/// [`XFILL_ERR_DATA`] (corrupted, or another format version: rebuild it),
+/// [`XFILL_ERR_ARG`], with a message in `*err` when `err` is not null.
+#[no_mangle]
+pub unsafe extern "C" fn xfill_dict_open(
+    path: *const c_char,
+    out: *mut *mut XfillWordlist,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, || {
+        if path.is_null() || out.is_null() {
+            set_err(err, "null pointer argument");
+            return XFILL_ERR_ARG;
+        }
+        // SAFETY: a NUL-terminated string from the caller
+        let Ok(path) = unsafe { CStr::from_ptr(path) }.to_str() else {
+            set_err(err, "path is not valid UTF-8");
+            return XFILL_ERR_ARG;
+        };
+        match Dictionary::open(std::path::Path::new(path)) {
             Ok(dict) => {
                 // SAFETY: `out` is a valid, writable pointer (checked non-null)
                 unsafe { *out = Box::into_raw(Box::new(XfillWordlist { dict })) };
                 XFILL_OK
             }
-            Err(e) => {
+            Err(OpenError::Io(e)) => {
+                set_err(err, &e);
+                XFILL_ERR_IO
+            }
+            Err(OpenError::Invalid(e)) => {
                 set_err(err, &e);
                 XFILL_ERR_DATA
             }
@@ -79,11 +136,22 @@ pub unsafe extern "C" fn xfill_wordlist_load_csv(
     })
 }
 
+/// `{"words", "bytes", "mapped"}`: words, size of the dictionary, and the
+/// part of it read in place from its file.
+fn stats(dict: &Dictionary) -> String {
+    serde_json::json!({
+        "words": dict.word_count(),
+        "bytes": dict.heap_bytes() + dict.mapped_bytes(),
+        "mapped": dict.mapped_bytes(),
+    })
+    .to_string()
+}
+
 /// Free a dictionary (null is ignored).
 #[no_mangle]
 pub unsafe extern "C" fn xfill_wordlist_free(wordlist: *mut XfillWordlist) {
     if !wordlist.is_null() {
-        // SAFETY: the handle came from `xfill_wordlist_load_csv` and is
+        // SAFETY: the handle came from `xfill_dict_open` and is
         // freed once
         guard_void(|| drop(unsafe { Box::from_raw(wordlist) }));
     }
@@ -100,14 +168,10 @@ pub unsafe extern "C" fn xfill_wordlist_stats(
         if wordlist.is_null() || stats_json.is_null() {
             return XFILL_ERR_ARG;
         }
-        // SAFETY: a live handle from `xfill_wordlist_load_csv`
+        // SAFETY: a live handle from `xfill_dict_open`
         let dict = unsafe { &(*wordlist).dict };
-        let stats = serde_json::json!({
-            "words": dict.word_count(),
-            "bytes": dict.heap_bytes(),
-        });
         // SAFETY: checked non-null
-        unsafe { *stats_json = to_c_string(stats.to_string()) };
+        unsafe { *stats_json = to_c_string(stats(dict)) };
         XFILL_OK
     })
 }
@@ -144,7 +208,7 @@ pub unsafe extern "C" fn xfill_generate(
                 return XFILL_ERR_JSON;
             }
         };
-        // SAFETY: a live handle from `xfill_wordlist_load_csv`
+        // SAFETY: a live handle from `xfill_dict_open`
         let dict = unsafe { &(*wordlist).dict };
         let flag = api::cancel_flag();
         let result = with_cancel_watch(cancel, &flag, || api::generate(dict, &req, &flag));
@@ -319,13 +383,33 @@ mod tests {
         out.into_bytes()
     }
 
+    fn temp(name: &str) -> CString {
+        let p = std::env::temp_dir().join(format!("xfill-ffi-{}-{name}.xfd", std::process::id()));
+        CString::new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// Build the test dictionary file and open it.
     fn load() -> *mut XfillWordlist {
         let bytes = csv();
+        let path = temp(&format!("{:?}", std::thread::current().id()));
+        let mut stats = null_mut();
+        let rc = unsafe {
+            xfill_dict_build(
+                bytes.as_ptr(),
+                bytes.len(),
+                path.as_ptr(),
+                &mut stats,
+                null_mut(),
+            )
+        };
+        assert_eq!(rc, XFILL_OK);
+        assert!(take(stats).contains("\"words\""));
         let mut wl = null_mut();
-        let rc =
-            unsafe { xfill_wordlist_load_csv(bytes.as_ptr(), bytes.len(), &mut wl, null_mut()) };
+        let rc = unsafe { xfill_dict_open(path.as_ptr(), &mut wl, null_mut()) };
         assert_eq!(rc, XFILL_OK);
         assert!(!wl.is_null());
+        // the open dictionary keeps the mapping: the file can go
+        std::fs::remove_file(path.to_str().unwrap()).ok();
         wl
     }
 
@@ -364,6 +448,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&take(stats)).unwrap();
         assert_eq!(v["words"], 8 * 8 + 8 * 8 * 8 + 8 * 8 * 8 * 8);
         assert!(v["bytes"].as_u64().unwrap() > 10_000);
+        // read in place from the file
+        assert!(v["mapped"].as_u64().unwrap() * 10 > v["bytes"].as_u64().unwrap() * 9);
         assert_eq!(
             unsafe { xfill_wordlist_stats(null(), &mut stats) },
             XFILL_ERR_ARG
@@ -378,23 +464,76 @@ mod tests {
     }
 
     #[test]
-    fn load_errors() {
+    fn build_and_open_errors() {
         let mut wl = null_mut();
         let mut err = null_mut();
+        let path = temp("errors");
         let empty = b"# nothing\n";
-        let rc = unsafe { xfill_wordlist_load_csv(empty.as_ptr(), empty.len(), &mut wl, &mut err) };
-        assert_eq!(rc, XFILL_ERR_DATA);
-        assert!(wl.is_null());
+        let build = |csv: *const u8, len: usize, path: *const c_char, err: *mut *mut c_char| unsafe {
+            xfill_dict_build(csv, len, path, null_mut(), err)
+        };
+        assert_eq!(
+            build(empty.as_ptr(), empty.len(), path.as_ptr(), &mut err),
+            XFILL_ERR_DATA
+        );
         assert!(take(err).contains("CSV"));
-        let rc = unsafe { xfill_wordlist_load_csv(null(), 3, &mut wl, &mut err) };
-        assert_eq!(rc, XFILL_ERR_ARG);
-        assert!(!take(err).is_empty());
-        let rc =
-            unsafe { xfill_wordlist_load_csv(empty.as_ptr(), empty.len(), null_mut(), null_mut()) };
-        assert_eq!(rc, XFILL_ERR_ARG);
         // zero-length input with a null pointer is an empty CSV
-        let rc = unsafe { xfill_wordlist_load_csv(null(), 0, &mut wl, null_mut()) };
-        assert_eq!(rc, XFILL_ERR_DATA);
+        assert_eq!(build(null(), 0, path.as_ptr(), null_mut()), XFILL_ERR_DATA);
+        assert_eq!(build(null(), 3, path.as_ptr(), &mut err), XFILL_ERR_ARG);
+        assert!(!take(err).is_empty());
+        assert_eq!(
+            build(empty.as_ptr(), empty.len(), null(), null_mut()),
+            XFILL_ERR_ARG
+        );
+        let bad_utf8 = [0xFFu8, 0];
+        assert_eq!(
+            build(
+                empty.as_ptr(),
+                empty.len(),
+                bad_utf8.as_ptr().cast(),
+                &mut err
+            ),
+            XFILL_ERR_ARG
+        );
+        assert!(take(err).contains("UTF-8"));
+        let csv = csv();
+        let no_dir = CString::new("/no/such/dir/dict.xfd").unwrap();
+        assert_eq!(
+            build(csv.as_ptr(), csv.len(), no_dir.as_ptr(), &mut err),
+            XFILL_ERR_IO
+        );
+        assert!(take(err).contains("cannot write"));
+        // open: missing, not a dictionary, bad arguments
+        assert_eq!(
+            unsafe { xfill_dict_open(no_dir.as_ptr(), &mut wl, &mut err) },
+            XFILL_ERR_IO
+        );
+        assert!(take(err).contains("cannot open"));
+        std::fs::write(
+            path.to_str().unwrap(),
+            b"not a dictionary file, just some text here....................",
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { xfill_dict_open(path.as_ptr(), &mut wl, &mut err) },
+            XFILL_ERR_DATA
+        );
+        assert!(take(err).contains("not a dictionary"));
+        assert!(wl.is_null());
+        assert_eq!(
+            unsafe { xfill_dict_open(path.as_ptr(), null_mut(), null_mut()) },
+            XFILL_ERR_ARG
+        );
+        assert_eq!(
+            unsafe { xfill_dict_open(null(), &mut wl, null_mut()) },
+            XFILL_ERR_ARG
+        );
+        assert_eq!(
+            unsafe { xfill_dict_open(bad_utf8.as_ptr().cast(), &mut wl, &mut err) },
+            XFILL_ERR_ARG
+        );
+        take(err);
+        std::fs::remove_file(path.to_str().unwrap()).ok();
     }
 
     #[test]

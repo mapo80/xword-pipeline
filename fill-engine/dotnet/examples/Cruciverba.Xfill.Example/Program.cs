@@ -12,9 +12,18 @@ string[] theme = Arg("--theme") is { } themePath
     : ["ARTE", "RETE", "SERA", "TANA", "NERO", "OSTE", "ROSA", "ORATE", "TENORI", "SIRENA"];
 ulong seed = ulong.TryParse(Arg("--seed"), out var s) ? s : 1;
 
-using var engine = XfillEngine.LoadWordlist(csv);
-Console.WriteLine($"xfill {XfillEngine.Version} on {System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier}");
-Console.WriteLine($"dictionary: {engine.WordCount} words, {engine.DictionaryBytes / 1024 / 1024.0:F1} MB (engine), {engine.MeasuredLoadBytes / 1024 / 1024.0:F1} MB (process)");
+// the engine runs in its own process (xfill-host); the dictionary is built once into a file
+// and then opened (mapped, about a millisecond)
+using var engine = XfillEngine.Start();
+Console.WriteLine($"xfill {engine.Version} on {System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier}");
+string dictionaryPath = Path.Combine(Path.GetTempPath(), $"xfill-example-{Environment.ProcessId}.xfd");
+var watch = System.Diagnostics.Stopwatch.StartNew();
+await engine.BuildDictionaryAsync(new MemoryStream(csv), dictionaryPath);
+var built = watch.Elapsed;
+watch.Restart();
+using var dictionary = await engine.OpenDictionaryAsync(dictionaryPath);
+Console.WriteLine($"dictionary: {dictionary.WordCount} words, {dictionary.DictionaryBytes / 1024 / 1024.0:F1} MB " +
+    $"({dictionary.MappedBytes / 1024 / 1024.0:F1} MB mapped); built in {built.TotalMilliseconds:F0} ms, opened in {watch.Elapsed.TotalMilliseconds:F1} ms");
 
 var request = new GenerateRequest
 {
@@ -25,7 +34,7 @@ var request = new GenerateRequest
     // the synthetic dictionary has words of at most 6 letters
     Blocks = Arg("--wordlist") is null ? 60 : null,
 };
-var result = await engine.GenerateAsync(request);
+var result = await dictionary.GenerateAsync(request);
 Console.WriteLine($"status: {result.Status} {result.Error}");
 if (result.Status != GenerateStatus.Ok)
 {
@@ -38,8 +47,9 @@ foreach (var row in result.Grid)
 Console.WriteLine($"{result.Cols} × {result.Rows}: {result.Blocks} blocks, {result.Entries.Count} words, score {result.Score:F1}, " +
     $"{result.WeakWords.Count} weak, {result.Attempts} attempts, {result.DurationMs} ms");
 Console.WriteLine($"theme words: {result.ThemeCount} ({string.Join(", ", result.ThemeWords)})");
-var report = XfillEngine.Validate(ValidateInput.FromResult(result));
+var report = await engine.ValidateAsync(ValidateInput.FromResult(result));
 Console.WriteLine($"validation: {(report.Valid ? "ok" : string.Join("; ", report.Errors.Select(e => $"{e.Code} {e.Message}")))}");
+File.Delete(dictionaryPath);
 if (!report.Valid)
 {
     return 2;

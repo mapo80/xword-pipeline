@@ -6,6 +6,7 @@
 //! the highest-quality entry. This makes score-ordered enumeration (iterate set
 //! bits low→high) and quality tiers (an index cutoff) fall out for free.
 
+use crate::mapped::Buf;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -72,19 +73,19 @@ pub struct LenData {
     pub n: usize,
     /// Letters, contiguous: word `w` is `flat[w * len..(w + 1) * len]`
     /// (symbols 0..25 = A..Z, then rebus symbols).
-    pub flat: Vec<u8>,
-    pub scores: Vec<u8>,
+    pub flat: Buf<u8>,
+    pub scores: Buf<u8>,
     /// Compatibility masks, one block run per (position, symbol) with at
     /// least one word: bitset of the words with symbol c at pos. Runs of
     /// `blocks_per_mask` u64 each; offset 0 is an all-zero run shared by
     /// every absent (position, symbol).
-    compat_blocks: Vec<u64>,
+    pub(crate) compat_blocks: Buf<u64>,
     /// compat_off[pos * ALPHA + c] = start of its run in `compat_blocks`.
-    compat_off: Vec<u32>,
-    blocks_per_mask: usize,
+    pub(crate) compat_off: Buf<u32>,
+    pub(crate) blocks_per_mask: usize,
     /// pos_count[pos * ALPHA + c] = number of words with letter c at pos
     /// (cheap O(1) least-constraining-value signal).
-    pub pos_count: Vec<u32>,
+    pub pos_count: Buf<u32>,
 }
 
 impl LenData {
@@ -167,22 +168,76 @@ impl LenData {
         LenData {
             len,
             n,
+            flat: flat.into(),
+            scores: scores.into(),
+            compat_blocks: compat_blocks.into(),
+            compat_off: compat_off.into(),
+            blocks_per_mask: nb,
+            pos_count: pos_count.into(),
+        }
+    }
+
+    /// Per-length data from its arrays (a dictionary file), checked so that
+    /// no later access can go out of bounds.
+    pub(crate) fn from_parts(
+        len: usize,
+        flat: Buf<u8>,
+        scores: Buf<u8>,
+        compat_blocks: Buf<u64>,
+        compat_off: Buf<u32>,
+        pos_count: Buf<u32>,
+        symbols: usize,
+    ) -> Result<LenData, String> {
+        let n = scores.len();
+        let nb = n.div_ceil(64).max(1);
+        let n_masks = if len >= MIN_LEN { len * ALPHA } else { 0 };
+        let bad = |what: &str| Err(format!("length {len}: {what}"));
+        if flat.len() != n * len || compat_off.len() != n_masks || pos_count.len() != n_masks {
+            return bad("array sizes");
+        }
+        if n > MAX_WORDS_PER_LEN
+            || compat_blocks.len() < nb
+            || !compat_blocks.len().is_multiple_of(nb)
+        {
+            return bad("mask sizes");
+        }
+        if compat_off
+            .iter()
+            .any(|&o| !(o as usize).is_multiple_of(nb) || o as usize + nb > compat_blocks.len())
+        {
+            return bad("mask offsets");
+        }
+        if flat.iter().any(|&c| c as usize >= symbols) {
+            return bad("letters");
+        }
+        Ok(LenData {
+            len,
+            n,
             flat,
             scores,
             compat_blocks,
             compat_off,
             blocks_per_mask: nb,
             pos_count,
-        }
+        })
     }
 
     /// Heap memory (bytes).
     fn heap_bytes(&self) -> usize {
-        self.flat.capacity()
-            + self.scores.capacity()
-            + self.compat_blocks.capacity() * 8
-            + self.compat_off.capacity() * 4
-            + self.pos_count.capacity() * 4
+        self.flat.heap_bytes()
+            + self.scores.heap_bytes()
+            + self.compat_blocks.heap_bytes()
+            + self.compat_off.heap_bytes()
+            + self.pos_count.heap_bytes()
+    }
+
+    /// Bytes read in place from a dictionary file.
+    fn mapped_bytes(&self) -> usize {
+        self.flat.mapped_bytes()
+            + self.scores.mapped_bytes()
+            + self.compat_blocks.mapped_bytes()
+            + self.compat_off.mapped_bytes()
+            + self.pos_count.mapped_bytes()
     }
 }
 
@@ -360,6 +415,11 @@ impl Wordlist {
     /// Number of words (all lengths).
     pub fn word_count(&self) -> usize {
         self.by_len.iter().map(|l| l.n).sum()
+    }
+
+    /// Bytes of the list read in place from a dictionary file.
+    pub fn mapped_bytes(&self) -> usize {
+        self.by_len.iter().map(LenData::mapped_bytes).sum()
     }
 
     /// Heap memory held by the list and its masks (bytes).

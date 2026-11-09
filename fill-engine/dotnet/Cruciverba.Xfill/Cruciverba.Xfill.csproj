@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsAotCompatible>true</IsAotCompatible>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <RootNamespace>Cruciverba.Xfill</RootNamespace>
@@ -10,12 +9,12 @@
     <PackageId>Cruciverba.Xfill</PackageId>
     <Version Condition="'$(Version)' == ''">0.1.0</Version>
     <Authors>mapo80</Authors>
-    <Description>.NET SDK of the xfill crossword engine: generation, validation, cancellation, OpenTelemetry. Native engine for win-x64, win-arm64, linux-x64, linux-arm64, osx-x64, osx-arm64.</Description>
+    <Description>.NET SDK of the xfill crossword engine: generation, validation, cancellation, OpenTelemetry. The native engine runs in a child process (xfill-host): a native fault never ends the application. Native engine for win-x64, win-arm64, linux-x64, linux-arm64, osx-x64, osx-arm64.</Description>
     <PackageTags>crossword;cruciverba;generator</PackageTags>
     <RepositoryUrl>https://github.com/mapo80/xword-pipeline</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <!-- Native libraries collected under dotnet/runtimes/<rid>/native/ before packing -->
+    <!-- Engine library + xfill-host collected under dotnet/runtimes/<rid>/native/ before packing -->
     <XfillRuntimesDir Condition="'$(XfillRuntimesDir)' == ''">$(MSBuildThisFileDirectory)../runtimes</XfillRuntimesDir>
   </PropertyGroup>
 

@@ -57,6 +57,23 @@ impl Dictionary {
     pub fn heap_bytes(&self) -> usize {
         self.words.heap_bytes() + self.clues.heap_bytes()
     }
+
+    /// Bytes used in place from a dictionary file (see [`Dictionary::open`]).
+    pub fn mapped_bytes(&self) -> usize {
+        self.words.mapped_bytes() + self.clues.mapped_bytes()
+    }
+
+    /// Open a dictionary file written by [`Dictionary::save`]: mapped and
+    /// used in place (no parsing, no copy). A corrupted file, or one of
+    /// another format version, is an error.
+    pub fn open(path: &std::path::Path) -> Result<Dictionary, crate::xfd::OpenError> {
+        crate::xfd::open(path)
+    }
+
+    /// Write this dictionary as a file for [`Dictionary::open`] (atomically).
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        crate::xfd::write(self, path)
+    }
 }
 
 /// Block symmetry of the generated pattern.

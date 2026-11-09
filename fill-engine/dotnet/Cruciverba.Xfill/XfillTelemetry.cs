@@ -23,17 +23,17 @@ public static class XfillTelemetry
     private static readonly Counter<long> Outcomes = Meter.CreateCounter<long>(
         "xfill.generate.outcomes", description: "Generations by outcome.");
 
-    private static readonly ConcurrentDictionary<XfillEngine, long> Dictionaries = new();
+    private static readonly ConcurrentDictionary<XfillDictionary, long> Dictionaries = new();
 
     private static readonly ObservableGauge<long> DictionaryMemory = Meter.CreateObservableGauge(
         "xfill.dictionary.memory",
         () => Dictionaries.Values.Sum(),
         unit: "By",
-        description: "Native memory of the loaded dictionaries (engine estimate).");
+        description: "Size of the open dictionaries (mostly mapped from their files).");
 
-    internal static void AddDictionary(XfillEngine engine) => Dictionaries[engine] = engine.DictionaryBytes;
+    internal static void AddDictionary(XfillDictionary dictionary) => Dictionaries[dictionary] = dictionary.DictionaryBytes;
 
-    internal static void RemoveDictionary(XfillEngine engine) => Dictionaries.TryRemove(engine, out _);
+    internal static void RemoveDictionary(XfillDictionary dictionary) => Dictionaries.TryRemove(dictionary, out _);
 
     internal static void Record(Activity? activity, GenerateResult? result, string outcome, double seconds)
     {

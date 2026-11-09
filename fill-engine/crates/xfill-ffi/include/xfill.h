@@ -24,8 +24,12 @@
 // The generation was cancelled through the cancellation flag.
 #define XFILL_CANCELLED -5
 
-// The dictionary CSV holds no usable word.
+// No usable word in the CSV, or a dictionary file corrupted or of
+// another format version.
 #define XFILL_ERR_DATA -6
+
+// A file can't be read or written.
+#define XFILL_ERR_IO -7
 
 // Opaque handle of a loaded dictionary (words, scores, clues).
 typedef struct XfillWordlist XfillWordlist;
@@ -37,11 +41,25 @@ extern "C" {
 // Engine version, a static NUL-terminated string (never free it).
 const char *xfill_version(void);
 
-// Load a `WORD,clue` CSV from memory (UTF-8 or Latin-1). On success
-// writes the handle to `*out` and returns [`XFILL_OK`]; on failure returns
-// an error code and, if `err` is not null, writes a message to `*err`
-// (free it with [`xfill_string_free`]).
-int xfill_wordlist_load_csv(const uint8_t *csv, size_t len, struct XfillWordlist **out, char **err);
+// Build a dictionary file at `path` (UTF-8, NUL-terminated) from a
+// `WORD,clue` CSV in memory (UTF-8 or Latin-1). The file is written
+// atomically (never seen half-written) and holds the dictionary ready for
+// [`xfill_dict_open`]. On success, if `stats_json` is not null, writes
+// `{"words","bytes"}` there. Errors: [`XFILL_ERR_DATA`] (no usable word),
+// [`XFILL_ERR_IO`] (the file can't be written), [`XFILL_ERR_ARG`], with a
+// message in `*err` when `err` is not null.
+int xfill_dict_build(const uint8_t *csv,
+                     size_t len,
+                     const char *path,
+                     char **stats_json,
+                     char **err);
+
+// Open the dictionary file at `path` (written by [`xfill_dict_build`]):
+// it is mapped and used in place — no parsing, no copy. On success writes
+// the handle to `*out`. Errors: [`XFILL_ERR_IO`] (missing or unreadable),
+// [`XFILL_ERR_DATA`] (corrupted, or another format version: rebuild it),
+// [`XFILL_ERR_ARG`], with a message in `*err` when `err` is not null.
+int xfill_dict_open(const char *path, struct XfillWordlist **out, char **err);
 
 // Free a dictionary (null is ignored).
 void xfill_wordlist_free(struct XfillWordlist *wordlist);

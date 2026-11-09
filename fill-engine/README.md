@@ -12,7 +12,8 @@ crates/
   xfill-cli/    binari: xfill, library, bench, parole
   xfill-ffi/    interfaccia C (libreria xfill: xfill.dll / libxfill.so /
                 libxfill.dylib), header include/xfill.h generato da cbindgen
-  xfill-perf/   benchmark e profilazione (quick, gen, heap), non pubblicato
+  xfill-perf/   benchmark e profilazione (quick, gen, heap, load, xfd), non pubblicato
+host/           xfill-host.c: il processo che esegue la libreria (isolamento dei guasti)
 dotnet/         SDK .NET Cruciverba.Xfill, test, esempio (vedi dotnet/README.md)
 bench/temi/     liste a tema di prova per `bench --theme`
 docs/           piano degli algoritmi e registro dei lavori
@@ -101,14 +102,25 @@ con schema, soluzione, parole numerate e definizioni; opzionalmente i PDF.
 | `--llm-config FILE`, `--llm-model M` | `../../.alibaba`, `qwen3.8-flash` | File con URL (riga 1) e chiave (riga 2); modello |
 | `--out PATH`, `--pdf DIR` | `../out/libraries/grid-library.json`, — | JSON e PDF |
 
-## Libreria: `api::generate` e interfaccia C
+## Libreria: dizionari, `api::generate` e interfaccia C
 
 ```rust
-let dict = xfill_core::api::Dictionary::from_csv_bytes(&std::fs::read("Db.csv")?)?;
+use xfill_core::api::{cancel_flag, generate, Dictionary, GenerateRequest};
+// una volta per versione dei dati: CSV → file del dizionario
+Dictionary::from_csv_bytes(&std::fs::read("Db.csv")?)?.save("dict.xfd".as_ref())?;
+// a ogni avvio: il file si mappa e si usa così com'è (~1 ms, nessuna copia)
+let dict = Dictionary::open("dict.xfd".as_ref())?;
 let req: GenerateRequest = serde_json::from_str(r#"{"rows": 12, "cols": 22, "theme_words": ["ROMA"]}"#)?;
-let res = xfill_core::api::generate(&dict, &req, &xfill_core::api::cancel_flag());
+let res = generate(&dict, &req, &cancel_flag());
 ```
 
+- **File del dizionario (`.xfd`)**: le strutture del dizionario (parole,
+  punteggi, maschere, definizioni compresse) scritte come stanno in memoria,
+  con intestazione, versione del formato e checksum
+  ([`src/xfd.rs`](crates/xfill-core/src/xfd.rs)). `Dictionary::open` mappa il
+  file: niente parsing, niente copie, nessun picco; le pagine sono del file
+  (condivise, recuperabili dal sistema). Un file danneggiato o di un altro
+  formato è rifiutato con un errore (si ricostruisce dal CSV).
 - `rows` e `cols` sono sempre espliciti (un formato «22 × 12», COLONNE ×
   RIGHE, è `rows: 12, cols: 22`).
 - Con `node_budget` (default 20.000 unità di lavoro per schema: nodi +
@@ -118,19 +130,37 @@ let res = xfill_core::api::generate(&dict, &req, &xfill_core::api::cancel_flag()
 - `threads: 0` (default) = un thread per griglia del pool (2, o 4 con parole a
   tema), al massimo uno per CPU: altri thread riempirebbero schemi poi
   scartati.
-- Memoria: il dizionario Db.csv occupa circa 4 MB (caricamento in circa 40 ms,
-  picco 4,5 MB oltre ai byte del CSV); ogni thread di riempimento circa 1 MB.
-  Per lunghezza si tengono al massimo 65.535 parole, le migliori.
+- Memoria: Db.csv (35.942 parole) = file di 2,7 MiB, aperto in 0,7 ms; l'export
+  della knowledge base (200.193 parole) = 15 MiB, aperto in 3,9 ms. Ogni
+  thread di riempimento 0,7–1,2 MiB. Per lunghezza si tengono al massimo
+  65.535 parole, le migliori.
 - `validate` controlla numerazione, coordinate, incroci, risposte rispetto
   alla griglia, parole ripetute, definizioni che contengono la risposta.
 
-L'interfaccia C (`crates/xfill-ffi/include/xfill.h`) espone le stesse
-funzioni con JSON UTF-8 in/out: `xfill_version`, `xfill_wordlist_load_csv`,
-`xfill_wordlist_free`, `xfill_wordlist_stats`, `xfill_generate`,
-`xfill_validate`, `xfill_string_free`. Codici: 0 ok, −1 argomento, −2 JSON,
-−3 richiesta non valida, −4 panic interno, −5 annullata, −6 dizionario vuoto.
-Header: `cbindgen --config cbindgen.toml --output include/xfill.h` (in
+L'interfaccia C (`crates/xfill-ffi/include/xfill.h`), JSON UTF-8 in/out:
+`xfill_version`, `xfill_dict_build` (CSV in memoria → file), `xfill_dict_open`
+(file → handle), `xfill_wordlist_free`, `xfill_wordlist_stats`,
+`xfill_generate`, `xfill_validate`, `xfill_string_free`. Codici: 0 ok,
+−1 argomento, −2 JSON, −3 richiesta non valida, −4 panic interno,
+−5 annullata, −6 dati non validi (CSV senza parole, file danneggiato o di un
+altro formato), −7 file non leggibile o non scrivibile. Header:
+`cbindgen --config cbindgen.toml --output include/xfill.h` (in
 `crates/xfill-ffi`; la CI verifica che sia aggiornato).
+
+## `xfill-host` — il motore in un processo a parte
+
+[`host/xfill-host.c`](host/xfill-host.c) (C11, nessuna dipendenza) carica la
+libreria compilata (`dlopen` / `LoadLibraryExW`) e ne inoltra l'interfaccia C
+su stdin/stdout (messaggi binari: `BUILD`, `OPEN`, `CLOSE`, `GENERATE`,
+`CANCEL`, `VALIDATE`). Un guasto nativo (abort, accesso non valido alla
+memoria, stack overflow, memoria esaurita) chiude solo questo processo; su
+Linux si offre come prima vittima dell'OOM killer (`oom_score_adj` 1000). Lo
+usa l'SDK .NET ([dotnet/README.md](dotnet/README.md)).
+
+```bash
+host/build.sh                 # accanto alla libreria in target/release (Linux, macOS, MinGW)
+cl /nologo /O2 /W4 /WX /std:c11 host\xfill-host.c /Fe:target\release\xfill-host.exe   # MSVC
+```
 
 ## `xfill` — riempie uno schema dato
 

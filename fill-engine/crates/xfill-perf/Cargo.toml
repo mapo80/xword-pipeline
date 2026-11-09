@@ -9,3 +9,4 @@ description = "Benchmarks and profiling harnesses of the engine (see docs/presta
 [dependencies]
 xfill-core = { path = "../xfill-core" }
 dhat = "=0.3.3"
+serde_json = "=1.0.154"

@@ -35,7 +35,7 @@ Punto di partenza: commit `45e8340` (versione 0.1.1). Unità: 1 MiB =
 
 | Strumento | Cosa misura | Installazione |
 |---|---|---|
-| `xfill-perf` (crate del workspace, non pubblicato) | `quick`: suite rapida del solver; `gen`: `api::generate` completo con impronte; `heap`: profilo dhat | incluso |
+| `xfill-perf` (crate del workspace, non pubblicato) | `quick`: suite rapida del solver; `gen`: `api::generate` completo con impronte; `heap`: profilo dhat; `load`: tempo, memoria e picco del caricamento del dizionario | incluso |
 | [samply](https://github.com/mstange/samply) | profilo della CPU a campionamento, grafo delle chiamate (Firefox Profiler) | `cargo install samply --locked` |
 | `sample` (macOS) | campionamento testuale di un processo in corso, con file e riga | di sistema |
 | `xctrace` (Instruments) | Time Profiler / Allocations da riga di comando | Xcode |
@@ -101,6 +101,13 @@ diff <(grep ^FP full-base.txt) <(grep ^FP full.txt) && echo IDENTICI
 Argomenti: `gen <csv> <thread> <semi> <formati>`; `thread 0` = default
 dell'API. Le righe `FP` contengono griglia, risposte e definizioni (hash),
 nodi, schemi provati e punteggio.
+
+Caricamento del dizionario (migliore di N, memoria finale, picco senza i
+byte del CSV):
+
+```bash
+./target/release/load $DB 20
+```
 
 ### 5. CPU
 
@@ -276,30 +283,126 @@ al minimo: per scendere ancora servirebbe fare meno revisioni (ordine della
 coda, euristiche), cosa che cambia il risultato e va valutata con il
 benchmark di qualità (`bench`).
 
+## Seconda fase: memoria (dopo fefa9e2)
+
+Stesse regole: impronte identiche alla 45e8340 (25 generazioni con 1 thread:
+griglie, definizioni, punteggi, nodi; 20 schemi della suite rapida).
+
+| # | Intervento | Effetto |
+|---|---|---|
+| F | **Definizioni compresse** con codici a coppie di byte (BPE). I 155 byte che il testo non usa mai diventano codici per le coppie più frequenti, anche in modo ricorsivo. I codici si imparano su una definizione ogni 32. Si codifica scegliendo, a ogni posizione, il codice con l'espansione più lunga che corrisponde, cercato per i primi due byte. Una definizione si decodifica solo quando serve (circa 70 per generazione). Test `clues_are_stored_compressed_and_come_back_intact` | testo 2,13 → 1,25 MB (58,8%, separatori compresi) |
+| G | Indice delle definizioni senza offset per definizione (ognuna è chiusa da 0xFF, byte che non compare mai in UTF-8) e risposte raggruppate per lunghezza, con record di dimensione fissa (senza offset per risposta) | −0,5 MB di indici |
+| H | Caricamento: i codici si imparano nella prima passata e ogni definizione si comprime mentre viene aggiunta, quindi il testo grezzo non è mai in memoria per intero. Indice per riga da 8 byte invece di 12 | picco di caricamento 4,5 → 3,0 MiB |
+| I | Trail del solver in **arene a blocchi fissi** (4.096 elementi) invece di `Vec` che raddoppiano: nessuna riallocazione e al massimo un blocco parzialmente usato. Record del trail da 40 a 20 byte | picco per thread −10…−25% |
+
+Tentativi misurati e scartati:
+
+| Idea | Misura | Esito |
+|---|---|---|
+| deflate a blocchi (Huffman) | 43,9% contro 58,8% | troppo codice da scrivere da zero per 0,3 MB; decompressione a blocchi |
+| LZ77 senza entropia, blocchi da 64 KB | 55,7% | accesso a blocchi, guadagno minimo |
+| BPE codificato per rango (fusioni ripetute) | 58,7%, 51 ms di codifica | sostituito dalla corrispondenza più lunga: 58,8%, 19 ms |
+| Confronto delle risposte con i primi 8 byte come intero, nell'ordinamento | 66 ms contro 58 ms | più lento |
+| Istantanee del trail con i soli blocchi non nulli | il 27,5% dei blocchi è nullo | guadagno di circa il 20% del trail dei domini, non vale la complessità |
+| `malloc_zone_pressure_relief` dopo il caricamento (macOS 26) | 291 ns, footprint invariato | nessun effetto con l'allocatore attuale; su Linux (`malloc_trim`) non verificabile qui, quindi non incluso |
+
+Risultati (5 formati × 3 semi; footprint misurato con `/usr/bin/time -l`,
+che include i 2,9 MiB del CSV letto dal programma di prova):
+
+| | 45e8340 | fefa9e2 | Dopo la seconda fase |
+|---|---|---|---|
+| Dizionario in memoria | 11,6 MiB | 4,05 MiB | **2,74 MiB** |
+| — definizioni | 6,4 MiB | 2,9 MiB | 1,58 MiB |
+| — parole e maschere | 2,2 MiB | 1,15 MiB | 1,15 MiB |
+| Picco di caricamento (senza il CSV) | 13,4 MiB | 4,5 MiB | **3,0 MiB** |
+| Caricamento | 38 ms | 37 ms | 58 ms |
+| Picco della generazione, 1 thread (13×13 / 15×15 / 12×22) | +0,90 / +1,31 / +1,50 MiB | +0,84 / +1,34 / +1,58 MiB | **+0,72 / +0,98 / +1,23 MiB** |
+| Footprint del processo, 1 thread | 26,8 MiB | 14,5 MiB | **11,5 MiB** |
+| Footprint del processo, default | 45,7 MiB | 15,9 MiB | **13,2 MiB** |
+| Tempo 13×13, 1 thread / default | 4,63 s / 16,4 s | 2,36 s / 1,40 s | 2,32 s / 1,44 s |
+
+Il caricamento passa da 37 a 58 ms (si impara e si applica la compressione)
+in cambio di 1,3 MiB permanenti in meno.
+
+## Terza fase: dizionari su file e motore isolato (0.2.0)
+
+Due problemi del servizio (`cruciverba.online`): un crash nativo del motore,
+caricato nel processo dell'API, chiudeva l'API; e ogni dizionario si
+ricostruiva dal CSV (query sul DB, CSV temporaneo, parsing) a ogni avvio e a
+ogni ricarica, con un picco di memoria. Sull'alfa i tre dizionari pesavano
+circa 105 MB misurati nel processo, su uno staging da 256 MB.
+
+| Componente | Cosa cambia |
+|---|---|
+| Libreria | **File del dizionario `.xfd`**: le strutture costruite dal CSV scritte come stanno in memoria (intestazione, versione del formato, checksum, sezioni allineate). `Dictionary::open` mappa il file (`mmap` / `MapViewOfFile`) e usa gli array sul posto (`Buf<T>`: proprietario o dentro una mappatura). File danneggiati, troncati, di un altro formato o incoerenti sono rifiutati senza panic (checksum e controlli di struttura, compresi i codici delle definizioni che non devono espandersi all'infinito). |
+| C ABI | `xfill_dict_build(csv, len, path)` e `xfill_dict_open(path)` al posto di `xfill_wordlist_load_csv`; codice −7 per i file. |
+| `xfill-host` (C) | Processo che carica la libreria compilata e ne inoltra l'interfaccia su pipe (`BUILD`, `OPEN`, `CLOSE`, `GENERATE`, `CANCEL`, `VALIDATE`); più dizionari aperti, generazioni su thread propri, annullamento immediato; CSV mappato in lettura; `oom_score_adj` 1000 su Linux. |
+| SDK .NET | `XfillEngine.Start()` (il processo), `BuildDictionaryAsync`, `OpenDictionaryAsync` → `XfillDictionary.GenerateAsync`, `ValidateAsync`. Se il processo termina: `XfillEngineCrashedException` per le chiamate in corso, poi riavvio e riapertura automatica dei dizionari. Limite di generazioni concorrenti. |
+| `cruciverba.online` | Un dizionario per versione del dataset e difficoltà (`App_Data/engine-dictionaries/dict-<versione>-<difficoltà>.xfd`): costruito una volta, poi solo aperto; si ricostruisce se il file manca o è di un altro formato; si tengono i file dell'attiva e dell'ultima diversa (scambio inverso). |
+
+Test: 177 core (formato: dizionario riaperto identico all'originale, stesse
+griglie; file danneggiati/estranei rifiutati), 10 FFI (copertura righe
+99%), 31 SDK .NET (guasti nativi veri nel processo motore: abort, SIGSEGV,
+stack overflow; processo ucciso durante una generazione; riapertura dopo il
+riavvio; limite di concorrenza; copertura righe 94%), 466 + 294 test di
+`cruciverba.online`.
+
+### Tempi e memoria
+
+Libreria (Rust, `xfill-perf xfd`), un thread:
+
+| Dizionario | Parole | Dal CSV | File | Apertura | Heap dopo l'apertura | Generazioni |
+|---|---|---|---|---|---|---|
+| Db.csv | 35.942 | 59 ms (picco 3,0 MiB) | 2,74 MiB | **0,7 ms** | 5,5 KiB | identiche, stessa velocità |
+| export KB | 200.193 | 230 ms (picco 15 MiB) | 15,05 MiB | **3,9 ms** | 5,5 KiB | identiche, stessa velocità |
+
+SDK .NET contro libreria nel processo (Db.csv, mediane): latenza per
+chiamata +60 µs (validazione 0,13 contro 0,07 ms), generazioni −2…+4% (rumore),
+avvio del processo motore 28 ms.
+
+Servizio con tre dizionari reali (150.035, 203.705, 200.193 parole), un seme
+per dizionario e formato:
+
+| | 0.1.1 (in produzione: nel processo, dal CSV) | 0.2.0 (processo motore, file `.xfd`) |
+|---|---|---|
+| Avvio fino al primo dizionario pronto | 612 ms (3 CSV già su disco; nel servizio anche la query sul DB e la scrittura dei CSV), a ogni avvio | 28 ms (processo) + 31 ms (3 dizionari) |
+| Costruzione dei dizionari | a ogni avvio e ricarica | una volta per versione del dataset: 786 ms per tutti e tre |
+| 13×13 / 15×15 / 12×22 (mediana) | 11,1 s / 25,4 s / 21,6 s | 846 ms / 3,9 s / 2,9 s |
+| Memoria (footprint) | **235 MB** (un solo processo) | 40 MB (.NET) + 8,7 MB (`xfill-host`); i 41,8 MB dei dizionari sono pagine dei file, pulite e recuperabili |
+| Crash nativo del motore | chiude il processo .NET | visto in 2 ms, ripristino (nuovo processo + riapertura + generazione) in 33 ms |
+
+Procedura: `cargo build --release -p xfill-ffi && host/build.sh`, poi
+`xfill-perf xfd <csv>` per la libreria; il confronto del servizio usa due
+programmi .NET che referenziano i pacchetti 0.1.1 e 0.2.0 (stessa macchina,
+stessi tre CSV), con il footprint misurato da `footprint` su entrambi i
+processi.
+
 ## Limiti noti
 
 - Al massimo **65.535 parole per lunghezza** (`MAX_WORDS_PER_LEN`): oltre, si
   tengono le migliori per punteggio.
+- Un file `.xfd` vale per la versione del formato che l'ha scritto
+  (`xfd::FORMAT`); dopo un cambio del formato si ricostruisce dal CSV
+  (`cruciverba.online` lo fa da solo).
+- La compilazione MSVC dell'host (`/W4 /WX`) si verifica solo in CI.
+- Risposte di al massimo 255 lettere nel database delle definizioni (le
+  parole della griglia ne hanno al massimo 24).
 - Il picco di memoria del solver dipende dal formato. È il trail, che
   conserva le istantanee dei domini e dei contatori lungo il percorso di
-  ricerca: 0,8 MiB in 13×13, 1,3 MiB in 15×15, 1,6 MiB in 12×22, per
-  thread.
+  ricerca: 0,7 MiB in 13×13, 1,0 MiB in 15×15, 1,2 MiB in 12×22, per thread.
+- La memoria liberata (buffer temporanei, il CSV del chiamante) resta
+  all'allocatore del processo. Con l'SDK .NET il CSV è memoria gestita da
+  .NET. Per un servizio conviene caricare il dizionario una volta all'avvio.
 
 ## Proposte (non fatte)
 
-1. **Definizioni compresse in memoria** (circa −1,2 MiB): sono la parte più
-   grande del dizionario (2,1 MiB di testo) e servono solo per le circa 70
-   voci della griglia scelta. Un dizionario di parole frequenti o una
-   compressione a blocchi le dimezzerebbe.
-2. **Dizionario senza definizioni** (1,15 MiB in tutto) per chi le tiene
+1. **Dizionario senza definizioni** (1,15 MiB in tutto) per chi le tiene
    altrove: serve un'opzione di caricamento in API, FFI e SDK.
-3. **Restituire la memoria al sistema dopo il caricamento**
-   (`malloc_zone_pressure_relief` su macOS e iOS, `malloc_trim` su glibc), o
-   caricare il dizionario all'avvio prima di tutto il resto: si recuperano i
-   circa 6 MiB trattenuti dall'allocatore.
-4. **Un solver per thread riusato tra gli schemi**, invece di uno nuovo per
-   schema: meno allocazioni (oggi circa 1.800 per schema) e meno
-   frammentazione.
+3. **Maschere compat sparse** per le lettere rare in una posizione: oggi
+   0,78 MiB, circa metà sono coppie (posizione, lettera) con poche parole.
+   Tocca il ciclo caldo, quindi va misurata la velocità.
+4. **Un solver per thread riusato tra gli schemi**: meno allocazioni (circa
+   1.800 per schema) e meno frammentazione. Non abbassa il picco.
 5. **Budget per schema** (`node_budget`, oggi 20.000): è il fattore che
    decide il tempo (ogni schema lo usa tutto per migliorare la qualità). Con
    il motore più veloce si può ricalibrare il compromesso qualità/tempo del

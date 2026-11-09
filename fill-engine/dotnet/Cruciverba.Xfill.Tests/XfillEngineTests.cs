@@ -6,20 +6,42 @@ using Xunit;
 
 namespace Cruciverba.Xfill.Tests;
 
-/// <summary>Shared dictionary: every 2..5-letter string over eight letters (a subset of length 5).</summary>
+/// <summary>
+/// Shared engine and dictionary: every 2..5-letter string over eight letters (a subset of
+/// length 5), built once into a dictionary file and opened.
+/// </summary>
 public sealed class DictionaryFixture : IDisposable
 {
     public DictionaryFixture()
     {
         Csv = BuildCsv();
-        Engine = XfillEngine.LoadWordlist(Csv);
+        Directory = System.IO.Directory.CreateTempSubdirectory("xfill-tests-").FullName;
+        CsvPath = Path.Combine(Directory, "dictionary.csv");
+        File.WriteAllBytes(CsvPath, Csv);
+        DictionaryPath = Path.Combine(Directory, "dictionary.xfd");
+        Engine = XfillEngine.Start();
+        Engine.BuildDictionaryAsync(CsvPath, DictionaryPath).GetAwaiter().GetResult();
+        Dictionary = Engine.OpenDictionaryAsync(DictionaryPath).GetAwaiter().GetResult();
     }
 
     public byte[] Csv { get; }
 
+    public string Directory { get; }
+
+    public string CsvPath { get; }
+
+    public string DictionaryPath { get; }
+
     public XfillEngine Engine { get; }
 
-    public void Dispose() => Engine.Dispose();
+    public XfillDictionary Dictionary { get; }
+
+    public void Dispose()
+    {
+        Dictionary.Dispose();
+        Engine.Dispose();
+        System.IO.Directory.Delete(Directory, recursive: true);
+    }
 
     private static byte[] BuildCsv()
     {
@@ -49,6 +71,7 @@ public sealed class DictionaryFixture : IDisposable
 public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<DictionaryFixture>
 {
     private readonly XfillEngine _engine = fixture.Engine;
+    private readonly XfillDictionary _dict = fixture.Dictionary;
 
     private static GenerateRequest Small(int rows, int cols) => new()
     {
@@ -62,42 +85,74 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     [Fact]
     public void Version_is_the_native_engine_version()
     {
-        XfillEngine.Version.ShouldMatch(@"^\d+\.\d+\.\d+");
+        _engine.Version.ShouldMatch(@"^\d+\.\d+\.\d+");
     }
 
     [Fact]
     public void Dictionary_reports_words_and_memory()
     {
-        _engine.WordCount.ShouldBeGreaterThan(1000);
-        _engine.DictionaryBytes.ShouldBeGreaterThan(_engine.WordCount);
-        _engine.MeasuredLoadBytes.ShouldBeGreaterThanOrEqualTo(0);
+        _dict.WordCount.ShouldBeGreaterThan(1000);
+        _dict.DictionaryBytes.ShouldBeGreaterThan(_dict.WordCount);
+        // read in place from the file
+        _dict.MappedBytes.ShouldBeGreaterThan(_dict.DictionaryBytes * 9 / 10);
+        _dict.Path.ShouldBe(fixture.DictionaryPath);
     }
 
     [Fact]
-    public async Task Loads_from_streams()
+    public async Task Builds_from_streams_and_files()
     {
-        using (var sync = XfillEngine.LoadWordlist(new MemoryStream(fixture.Csv)))
-        {
-            sync.WordCount.ShouldBe(_engine.WordCount);
-        }
-        using var async = await XfillEngine.LoadWordlistAsync(new MemoryStream(fixture.Csv), TestContext.Current.CancellationToken);
-        async.WordCount.ShouldBe(_engine.WordCount);
-        Should.Throw<ArgumentNullException>(() => XfillEngine.LoadWordlist((Stream)null!));
-        await Should.ThrowAsync<ArgumentNullException>(() => XfillEngine.LoadWordlistAsync(null!));
+        var ct = TestContext.Current.CancellationToken;
+        string path = Path.Combine(fixture.Directory, "from-stream.xfd");
+        var stats = await _engine.BuildDictionaryAsync(new MemoryStream(fixture.Csv), path, ct);
+        stats.Words.ShouldBe(_dict.WordCount);
+        stats.Bytes.ShouldBeGreaterThan(0);
+        File.ReadAllBytes(path).ShouldBe(File.ReadAllBytes(fixture.DictionaryPath));
+        await Should.ThrowAsync<ArgumentNullException>(() => _engine.BuildDictionaryAsync((Stream)null!, path, ct));
+        await Should.ThrowAsync<ArgumentNullException>(() => _engine.BuildDictionaryAsync(fixture.CsvPath, null!, ct));
+        await Should.ThrowAsync<ArgumentNullException>(() => _engine.OpenDictionaryAsync(null!, ct));
     }
 
     [Fact]
-    public void An_empty_csv_is_rejected()
+    public async Task Bad_inputs_are_errors_not_crashes()
     {
-        var ex = Should.Throw<XfillException>(() => XfillEngine.LoadWordlist("# niente\n"u8));
-        ex.Code.ShouldBe(-6);
-        ex.Message.ShouldContain("CSV");
+        var ct = TestContext.Current.CancellationToken;
+        string dir = fixture.Directory;
+        var empty = await Should.ThrowAsync<XfillException>(() =>
+            _engine.BuildDictionaryAsync(new MemoryStream("# niente\n"u8.ToArray()), Path.Combine(dir, "empty.xfd"), ct));
+        empty.Code.ShouldBe(-6);
+        empty.Message.ShouldContain("CSV");
+        (await Should.ThrowAsync<XfillException>(() =>
+            _engine.BuildDictionaryAsync(Path.Combine(dir, "missing.csv"), Path.Combine(dir, "x.xfd"), ct))).Code.ShouldBe(-7);
+        (await Should.ThrowAsync<XfillException>(() =>
+            _engine.BuildDictionaryAsync(fixture.CsvPath, Path.Combine(dir, "no-dir", "x.xfd"), ct))).Code.ShouldBe(-7);
+        (await Should.ThrowAsync<XfillException>(() => _engine.OpenDictionaryAsync(Path.Combine(dir, "missing.xfd"), ct))).Code.ShouldBe(-7);
+        // a corrupted file is refused: rebuild it
+        string corrupted = Path.Combine(dir, "corrupted.xfd");
+        byte[] bytes = File.ReadAllBytes(fixture.DictionaryPath);
+        bytes[^100] ^= 1;
+        File.WriteAllBytes(corrupted, bytes);
+        var bad = await Should.ThrowAsync<XfillException>(() => _engine.OpenDictionaryAsync(corrupted, ct));
+        bad.Code.ShouldBe(-6);
+        bad.Message.ShouldContain("checksum");
+        _engine.HostRestarts.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task A_closed_dictionary_refuses_work_and_others_go_on()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var second = await _engine.OpenDictionaryAsync(fixture.DictionaryPath, ct);
+        (await second.GenerateAsync(Small(5, 5) with { Blocks = 2, Seed = 3 }, ct)).Status.ShouldBe(GenerateStatus.Ok);
+        second.Dispose();
+        second.Dispose();
+        await Should.ThrowAsync<ObjectDisposedException>(() => second.GenerateAsync(Small(5, 5)));
+        (await _dict.GenerateAsync(Small(5, 5) with { Blocks = 2, Seed = 3 }, ct)).Status.ShouldBe(GenerateStatus.Ok);
     }
 
     [Fact]
     public async Task Generates_a_rectangular_grid_that_validates()
     {
-        var result = await _engine.GenerateAsync(Small(6, 9) with { Blocks = 12 }, TestContext.Current.CancellationToken);
+        var result = await _dict.GenerateAsync(Small(6, 9) with { Blocks = 12 }, TestContext.Current.CancellationToken);
 
         result.Status.ShouldBe(GenerateStatus.Ok, result.Error);
         (result.Rows, result.Cols).ShouldBe((6, 9));
@@ -108,7 +163,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
         result.Entries.ShouldNotBeEmpty();
         result.Entries.ShouldAllBe(e => e.Clue != null && e.Answer.Length == e.Length);
         result.Entries.ShouldContain(e => e.Direction == Direction.Down);
-        result.EngineVersion.ShouldBe(XfillEngine.Version);
+        result.EngineVersion.ShouldBe(_engine.Version);
         result.Score.ShouldBeGreaterThan(0);
         result.Attempts.ShouldBeGreaterThanOrEqualTo(1);
         result.Filled.ShouldBeGreaterThanOrEqualTo(1);
@@ -118,7 +173,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
         result.WeakWords.ShouldNotBeNull();
         result.DurationMs.ShouldBeGreaterThanOrEqualTo(0UL);
 
-        var report = XfillEngine.Validate(ValidateInput.FromResult(result));
+        var report = await _engine.ValidateAsync(ValidateInput.FromResult(result));
         report.Valid.ShouldBeTrue();
         report.Slots.ShouldBe(result.Entries.Count);
         report.Errors.ShouldBeEmpty();
@@ -128,8 +183,8 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     public async Task Same_seed_gives_the_same_grid_with_any_thread_count()
     {
         var ct = TestContext.Current.CancellationToken;
-        var one = await _engine.GenerateAsync(Small(5, 5) with { Blocks = 4, Seed = 5, Threads = 1, Symmetry = Symmetry.Mirror }, ct);
-        var four = await _engine.GenerateAsync(Small(5, 5) with { Blocks = 4, Seed = 5, Threads = 4, Symmetry = Symmetry.Mirror }, ct);
+        var one = await _dict.GenerateAsync(Small(5, 5) with { Blocks = 4, Seed = 5, Threads = 1, Symmetry = Symmetry.Mirror }, ct);
+        var four = await _dict.GenerateAsync(Small(5, 5) with { Blocks = 4, Seed = 5, Threads = 4, Symmetry = Symmetry.Mirror }, ct);
         one.Status.ShouldBe(GenerateStatus.Ok, one.Error);
         four.Grid.ShouldBe(one.Grid);
         four.Entries.ShouldBe(one.Entries);
@@ -145,7 +200,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
             ThemeWeight = 2,
             ThemeSlots = true,
         };
-        var result = await _engine.GenerateAsync(request, TestContext.Current.CancellationToken);
+        var result = await _dict.GenerateAsync(request, TestContext.Current.CancellationToken);
         result.ThemeRequested.ShouldBe(8);
         result.ThemeInDictionary.ShouldBe(7);
         result.ThemeCount.ShouldBeGreaterThanOrEqualTo(1);
@@ -155,7 +210,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     [Fact]
     public async Task Impossible_requests_return_no_grid()
     {
-        var result = await _engine.GenerateAsync(Small(9, 9) with { Blocks = 0, Candidates = 3 }, TestContext.Current.CancellationToken);
+        var result = await _dict.GenerateAsync(Small(9, 9) with { Blocks = 0, Candidates = 3 }, TestContext.Current.CancellationToken);
         result.Status.ShouldBe(GenerateStatus.NoGrid);
         result.Error.ShouldNotBeNullOrEmpty();
         result.Grid.ShouldBeEmpty();
@@ -164,11 +219,11 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     [Fact]
     public async Task Invalid_requests_throw()
     {
-        var ex = await Should.ThrowAsync<XfillException>(() => _engine.GenerateAsync(Small(1, 9)));
+        var ex = await Should.ThrowAsync<XfillException>(() => _dict.GenerateAsync(Small(1, 9)));
         ex.Code.ShouldBe(-3);
         ex.Message.ShouldContain("rows");
-        await Should.ThrowAsync<XfillException>(() => _engine.GenerateAsync(Small(5, 5) with { Optimize = "fast" }));
-        await Should.ThrowAsync<ArgumentNullException>(() => _engine.GenerateAsync(null!));
+        await Should.ThrowAsync<XfillException>(() => _dict.GenerateAsync(Small(5, 5) with { Optimize = "fast" }));
+        await Should.ThrowAsync<ArgumentNullException>(() => _dict.GenerateAsync(null!));
     }
 
     [Fact]
@@ -176,7 +231,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     {
         var request = Small(7, 7) with { Blocks = 12, NodeBudget = 0, TimePerGridS = 30, Candidates = 40, Pool = 40, Threads = 2 };
         using var cts = new CancellationTokenSource();
-        var task = _engine.GenerateAsync(request, cts.Token);
+        var task = _dict.GenerateAsync(request, cts.Token);
         await Task.Delay(200, TestContext.Current.CancellationToken);
         var watch = Stopwatch.StartNew();
         await cts.CancelAsync();
@@ -190,7 +245,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     {
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
-        await Should.ThrowAsync<OperationCanceledException>(() => _engine.GenerateAsync(Small(7, 7), cts.Token));
+        await Should.ThrowAsync<OperationCanceledException>(() => _dict.GenerateAsync(Small(7, 7), cts.Token));
     }
 
     [Fact]
@@ -198,7 +253,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     {
         var ct = TestContext.Current.CancellationToken;
         var tasks = Enumerable.Range(0, 4)
-            .Select(_ => _engine.GenerateAsync(Small(5, 5) with { Blocks = 2, Seed = 3, Threads = 1 }, ct))
+            .Select(_ => _dict.GenerateAsync(Small(5, 5) with { Blocks = 2, Seed = 3, Threads = 1 }, ct))
             .ToArray();
         var results = await Task.WhenAll(tasks);
         results.ShouldAllBe(r => r.Status == GenerateStatus.Ok);
@@ -208,22 +263,26 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
     [Fact]
     public async Task A_disposed_engine_refuses_work()
     {
-        var engine = XfillEngine.LoadWordlist(fixture.Csv);
+        var engine = XfillEngine.Start();
+        var dict = await engine.OpenDictionaryAsync(fixture.DictionaryPath, TestContext.Current.CancellationToken);
         engine.Dispose();
         engine.IsDisposed.ShouldBeTrue();
         engine.Dispose();
-        await Should.ThrowAsync<ObjectDisposedException>(() => engine.GenerateAsync(Small(5, 5)));
+        await Should.ThrowAsync<ObjectDisposedException>(() => dict.GenerateAsync(Small(5, 5)));
+        await Should.ThrowAsync<ObjectDisposedException>(() => engine.OpenDictionaryAsync(fixture.DictionaryPath));
+        await Should.ThrowAsync<ObjectDisposedException>(() => engine.ValidateAsync(new ValidateInput()));
+        dict.Dispose(); // nothing left to close
     }
 
     [Fact]
-    public void Validate_reports_errors()
+    public async Task Validate_reports_errors()
     {
         var entries = new List<Entry>
         {
             new() { Number = 1, Direction = Direction.Across, Row = 0, Col = 0, Length = 4, Answer = "CASA", Clue = "Abitazione" },
             new() { Number = 2, Direction = Direction.Across, Row = 2, Col = 0, Length = 4, Answer = "CASA", Clue = "La casa" },
         };
-        var report = XfillEngine.Validate(new ValidateInput { Rows = 3, Cols = 4, Grid = ["CASA", "####", "CASA"], Entries = entries });
+        var report = await _engine.ValidateAsync(new ValidateInput { Rows = 3, Cols = 4, Grid = ["CASA", "####", "CASA"], Entries = entries });
         report.Valid.ShouldBeFalse();
         report.Errors.Select(e => e.Code).ShouldBe(["clue_contains_answer", "repeated_word"], ignoreOrder: true);
         var repeated = report.Errors.Single(e => e.Code == "repeated_word");
@@ -232,10 +291,10 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
         report.Warnings.ShouldBeEmpty();
         report.Slots.ShouldBe(2);
 
-        var bad = Should.Throw<XfillException>(() => XfillEngine.Validate(new ValidateInput { Rows = -1, Cols = 1 }));
+        var bad = await Should.ThrowAsync<XfillException>(() => _engine.ValidateAsync(new ValidateInput { Rows = -1, Cols = 1 }));
         bad.Code.ShouldBe(-2);
         bad.Message.ShouldContain("bad_json");
-        Should.Throw<ArgumentNullException>(() => XfillEngine.Validate(null!));
+        await Should.ThrowAsync<ArgumentNullException>(() => _engine.ValidateAsync(null!));
         Should.Throw<ArgumentNullException>(() => ValidateInput.FromResult(null!));
     }
 
@@ -266,15 +325,16 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
         meters.SetMeasurementEventCallback<long>((i, v, _, _) => { lock (measurements) { measurements.Add((i.Name, v)); } });
         meters.Start();
 
-        using var engine = XfillEngine.LoadWordlist(fixture.Csv);
-        var result = await engine.GenerateAsync(Small(5, 7) with { Blocks = 6, Seed = 9 }, TestContext.Current.CancellationToken);
+        using var engine = XfillEngine.Start();
+        using var dict = await engine.OpenDictionaryAsync(fixture.DictionaryPath, TestContext.Current.CancellationToken);
+        var result = await dict.GenerateAsync(Small(5, 7) with { Blocks = 6, Seed = 9 }, TestContext.Current.CancellationToken);
         meters.RecordObservableInstruments();
 
         Activity span;
         lock (spans)
         {
             span = spans.Last(a => a.OperationName == "xfill.generate" && Equals(a.GetTagItem("xfill.seed"), 9UL));
-            spans.ShouldContain(a => a.OperationName == "xfill.load_wordlist");
+            spans.ShouldContain(a => a.OperationName == "xfill.open_dictionary");
         }
         span.GetTagItem("xfill.format").ShouldBe("7x5");
         span.GetTagItem("xfill.outcome").ShouldBe(result.Status.ToString());
@@ -286,7 +346,7 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
         {
             measurements.ShouldContain(m => m.Name == "xfill.generate.duration" && m.Value > 0);
             measurements.ShouldContain(m => m.Name == "xfill.generate.outcomes" && m.Value == 1);
-            measurements.ShouldContain(m => m.Name == "xfill.dictionary.memory" && m.Value >= engine.DictionaryBytes);
+            measurements.ShouldContain(m => m.Name == "xfill.dictionary.memory" && m.Value >= dict.DictionaryBytes);
         }
     }
 
@@ -301,13 +361,13 @@ public sealed class XfillEngineTests(DictionaryFixture fixture) : IClassFixture<
             ActivityStopped = a => { lock (spans) { spans.Add(a); } },
         };
         ActivitySource.AddActivityListener(listener);
-        await Should.ThrowAsync<XfillException>(() => _engine.GenerateAsync(Small(5, 5) with { Blocks = 99 }));
-        Should.Throw<XfillException>(() => XfillEngine.LoadWordlist(ReadOnlySpan<byte>.Empty));
+        await Should.ThrowAsync<XfillException>(() => _dict.GenerateAsync(Small(5, 5) with { Blocks = 99 }));
+        await Should.ThrowAsync<XfillException>(() => _engine.OpenDictionaryAsync(fixture.CsvPath));
         lock (spans)
         {
             spans.ShouldContain(a => a.OperationName == "xfill.generate" && a.Status == ActivityStatusCode.Error
                 && Equals(a.GetTagItem("xfill.outcome"), "InvalidRequest"));
-            spans.ShouldContain(a => a.OperationName == "xfill.load_wordlist" && a.Status == ActivityStatusCode.Error);
+            spans.ShouldContain(a => a.OperationName == "xfill.open_dictionary" && a.Status == ActivityStatusCode.Error);
         }
     }
 }

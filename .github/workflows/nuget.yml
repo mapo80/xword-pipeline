@@ -37,12 +37,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { rid: win-x64, os: windows-latest, target: x86_64-pc-windows-msvc, lib: xfill.dll, dotnet: true }
-          - { rid: win-arm64, os: windows-11-arm, target: aarch64-pc-windows-msvc, lib: xfill.dll, dotnet: true }
-          - { rid: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, lib: libxfill.so, dotnet: true }
-          - { rid: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, lib: libxfill.so, dotnet: true }
-          - { rid: osx-arm64, os: macos-latest, target: aarch64-apple-darwin, lib: libxfill.dylib, dotnet: true }
-          - { rid: osx-x64, os: macos-15-intel, target: x86_64-apple-darwin, lib: libxfill.dylib, dotnet: true }
+          - { rid: win-x64, os: windows-latest, target: x86_64-pc-windows-msvc, lib: xfill.dll, host: xfill-host.exe, msvc: amd64, dotnet: true }
+          - { rid: win-arm64, os: windows-11-arm, target: aarch64-pc-windows-msvc, lib: xfill.dll, host: xfill-host.exe, msvc: arm64, dotnet: true }
+          - { rid: linux-x64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, lib: libxfill.so, host: xfill-host, dotnet: true }
+          - { rid: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, lib: libxfill.so, host: xfill-host, dotnet: true }
+          - { rid: osx-arm64, os: macos-latest, target: aarch64-apple-darwin, lib: libxfill.dylib, host: xfill-host, dotnet: true }
+          - { rid: osx-x64, os: macos-15-intel, target: x86_64-apple-darwin, lib: libxfill.dylib, host: xfill-host, dotnet: true }
     defaults:
       run:
         shell: bash
@@ -67,6 +67,22 @@ jobs:
       - name: Native library
         run: cargo build --release -p xfill-ffi --target ${{ matrix.target }}
 
+      # xfill-host: the process that runs the library (a native fault never ends the .NET app)
+      - name: Engine host (Unix)
+        if: runner.os != 'Windows'
+        run: host/build.sh target/${{ matrix.target }}/release
+
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
+
+      - name: Engine host (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: cl /nologo /O2 /W4 /WX /std:c11 host\xfill-host.c /Fe:target\${{ matrix.target }}\release\xfill-host.exe
+
       - name: .NET SDK
         if: matrix.dotnet
         uses: actions/setup-dotnet@v6
@@ -87,7 +103,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.rid }}
-          path: fill-engine/target/${{ matrix.target }}/release/${{ matrix.lib }}
+          path: |
+            fill-engine/target/${{ matrix.target }}/release/${{ matrix.lib }}
+            fill-engine/target/${{ matrix.target }}/release/${{ matrix.host }}
           if-no-files-found: error
 
   pack:
@@ -135,12 +153,15 @@ jobs:
       - name: dotnet pack
         run: dotnet pack Cruciverba.Xfill -c Release -o artifacts -p:Version=${{ steps.version.outputs.version }}
 
-      - name: Check the six natives are in the package
+      - name: Check the six libraries and hosts are in the package
         run: |
           pkg="artifacts/Cruciverba.Xfill.${{ steps.version.outputs.version }}.nupkg"
           for f in win-x64/native/xfill.dll win-arm64/native/xfill.dll \
                    linux-x64/native/libxfill.so linux-arm64/native/libxfill.so \
-                   osx-x64/native/libxfill.dylib osx-arm64/native/libxfill.dylib; do
+                   osx-x64/native/libxfill.dylib osx-arm64/native/libxfill.dylib \
+                   win-x64/native/xfill-host.exe win-arm64/native/xfill-host.exe \
+                   linux-x64/native/xfill-host linux-arm64/native/xfill-host \
+                   osx-x64/native/xfill-host osx-arm64/native/xfill-host; do
             unzip -l "$pkg" | grep -q "runtimes/$f" || { echo "missing runtimes/$f"; exit 1; }
           done
 

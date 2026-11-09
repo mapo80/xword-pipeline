@@ -271,7 +271,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "xfill-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "xfill-core",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "xfill-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "xfill-ffi"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "xfill-core",
@@ -295,9 +295,10 @@ dependencies = [
 
 [[package]]
 name = "xfill-perf"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "dhat",
+ "serde_json",
  "xfill-core",
 ]
 

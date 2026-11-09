@@ -215,10 +215,23 @@ public sealed record ValidationReport
     public int Slots { get; init; }
 }
 
-internal sealed record WordlistStats
+/// <summary>Size of a dictionary.</summary>
+public sealed record DictionaryStats
 {
+    /// <summary>Words of the fill list.</summary>
+    public long Words { get; init; }
+
+    /// <summary>Size of the dictionary (words, masks, compressed clues), bytes.</summary>
+    public long Bytes { get; init; }
+}
+
+/// <summary>Reply of the engine process to BUILD and OPEN.</summary>
+internal sealed record HostStats
+{
+    public uint Dict { get; init; }
     public long Words { get; init; }
     public long Bytes { get; init; }
+    public long Mapped { get; init; }
 }
 
 [JsonSourceGenerationOptions(
@@ -228,7 +241,7 @@ internal sealed record WordlistStats
 [JsonSerializable(typeof(GenerateResult))]
 [JsonSerializable(typeof(ValidateInput))]
 [JsonSerializable(typeof(ValidationReport))]
-[JsonSerializable(typeof(WordlistStats))]
+[JsonSerializable(typeof(HostStats))]
 internal sealed partial class XfillJsonContext : JsonSerializerContext
 {
 }
